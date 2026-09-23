@@ -31,7 +31,8 @@
 
 using namespace std;
 
-#include "support/not_implemented.h"
+namespace {
+
 
 // See 3.9.1: Fundamental Types
 enum EFundamentalType
@@ -567,70 +568,79 @@ string HexDump(const void* pdata, size_t nbytes)
 struct DebugPostTokenOutputStream
 {
   explicit DebugPostTokenOutputStream(std::ostream & output, bool * invalid)
-    : output_(output), saw_invalid_(invalid) {}
+    : output_(output), saw_invalid_(invalid) { pending_.reserve(65536); }
   std::ostream & output_;
   bool * saw_invalid_;
 
-	// output: invalid <source>
-	void emit_invalid(const string& source)
-	{
-		if (saw_invalid_) *saw_invalid_ = true;
-		output_ << "invalid " << source << '\n';
-	}
-
-	// output: simple <source> <token_type>
-	void emit_simple(const string& source, ETokenType token_type)
-	{
-		output_ << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << '\n';
-	}
-
-	// output: identifier <source>
-	void emit_identifier(const string& source)
-	{
-		output_ << "identifier " << source << '\n';
-	}
-
-	// output: literal <source> <type> <hexdump(data,nbytes)>
-	void emit_literal(const string& source, EFundamentalType type, const void* data, size_t nbytes)
-	{
-		output_ << "literal " << source << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
-	}
-
-	// output: literal <source> array of <num_elements> <type> <hexdump(data,nbytes)>
-	void emit_literal_array(const string& source, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
-	{
-		output_ << "literal " << source << " array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
-	}
-
-	// output: user-defined-literal <source> <ud_suffix> character <type> <hexdump(data,nbytes)>
-	void emit_user_defined_literal_character(const string& source, const string& ud_suffix, EFundamentalType type, const void* data, size_t nbytes)
-	{
-		output_ << "user-defined-literal " << source << " " << ud_suffix << " character " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
-	}
-
-	// output: user-defined-literal <source> <ud_suffix> string array of <num_elements> <type> <hexdump(data, nbytes)>
-	void emit_user_defined_literal_string_array(const string& source, const string& ud_suffix, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
-	{
-		output_ << "user-defined-literal " << source << " " << ud_suffix << " string array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
-	}
-
-	// output: user-defined-literal <source> <ud_suffix> <prefix>
-	void emit_user_defined_literal_integer(const string& source, const string& ud_suffix, const string& prefix)
-	{
-		output_ << "user-defined-literal " << source << " " << ud_suffix << " integer " << prefix << '\n';
-	}
-
-	// output: user-defined-literal <source> <ud_suffix> <prefix>
-	void emit_user_defined_literal_floating(const string& source, const string& ud_suffix, const string& prefix)
-	{
-		output_ << "user-defined-literal " << source << " " << ud_suffix << " floating " << prefix << '\n';
-	}
-
-	// output : eof
-	void emit_eof()
-	{
-		output_ << "eof" << '\n';
-	}
+  void emit_invalid(const string& source)
+  {
+    if (saw_invalid_) *saw_invalid_ = true;
+    pending_.append("invalid "); pending_.append(source); finish_record();
+  }
+  void emit_simple(const string& source, ETokenType token_type)
+  {
+    pending_.append("simple "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(TokenTypeToStringMap.at(token_type)); finish_record();
+  }
+  void emit_identifier(const string& source)
+  {
+    pending_.append("identifier "); pending_.append(source); finish_record();
+  }
+  void emit_literal(const string& source, EFundamentalType type, const void* data, size_t nbytes)
+  {
+    pending_.append("literal "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
+    pending_.append(HexDump(data, nbytes)); finish_record();
+  }
+  void emit_literal_array(const string& source, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
+  {
+    pending_.append("literal "); pending_.append(source); pending_.append(" array of ");
+    pending_.append(std::to_string(num_elements)); pending_.push_back(' ');
+    pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
+    pending_.append(HexDump(data, nbytes)); finish_record();
+  }
+  void emit_user_defined_literal_character(const string& source, const string& ud_suffix, EFundamentalType type, const void* data, size_t nbytes)
+  {
+    pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(ud_suffix); pending_.append(" character ");
+    pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
+    pending_.append(HexDump(data, nbytes)); finish_record();
+  }
+  void emit_user_defined_literal_string_array(const string& source, const string& ud_suffix, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
+  {
+    pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(ud_suffix); pending_.append(" string array of ");
+    pending_.append(std::to_string(num_elements)); pending_.push_back(' ');
+    pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
+    pending_.append(HexDump(data, nbytes)); finish_record();
+  }
+  void emit_user_defined_literal_integer(const string& source, const string& ud_suffix, const string& prefix)
+  {
+    pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(ud_suffix); pending_.append(" integer "); pending_.append(prefix); finish_record();
+  }
+  void emit_user_defined_literal_floating(const string& source, const string& ud_suffix, const string& prefix)
+  {
+    pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
+    pending_.append(ud_suffix); pending_.append(" floating "); pending_.append(prefix); finish_record();
+  }
+  void emit_eof()
+  {
+    pending_.append("eof"); finish_record(); flush();
+  }
+private:
+  string pending_;
+  void finish_record()
+  {
+    pending_.push_back('\n');
+    if (pending_.size() >= 65536) flush();
+  }
+  void flush()
+  {
+    if (pending_.empty()) return;
+    output_.write(pending_.data(), static_cast<std::streamsize>(pending_.size()));
+    pending_.clear();
+  }
 };
 
 
@@ -662,8 +672,6 @@ long double PA2Decode_long_double(const string& s)
 
 // PA2's post-tokenizer is an event consumer: ordinary tokens are converted
 // immediately, while only one maximal adjacent string run is retained.
-namespace {
-
 struct LiteralFailure {};
 
 enum Encoding { ENC_ORDINARY, ENC_UTF8, ENC_UTF16, ENC_UTF32, ENC_WCHAR };
@@ -1500,9 +1508,6 @@ private:
   }
 };
 
-} // anonymous namespace
-
-namespace {
 class PostTokenAdapter : public IPPTokenStream
 {
 public:
@@ -1527,7 +1532,7 @@ private:
   DebugPostTokenOutputStream output_;
   PostTokenStream stream_;
 };
-}
+} // anonymous implementation namespace
 
 std::unique_ptr<IPPTokenStream> create_posttoken_stream(std::ostream & output,
                                                         bool * saw_invalid)

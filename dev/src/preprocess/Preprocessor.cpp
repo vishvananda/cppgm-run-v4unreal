@@ -55,7 +55,8 @@ struct PaintNode
 struct Token
 {
   TokenKind kind;
-  string text, file;
+  string text;
+  shared_ptr<const string> file;
   size_t line, column, presumed_line;
   Paint unavailable;
   Paint inherited_paint;
@@ -344,7 +345,7 @@ private:
     macros_[name] = m;
   }
 
-  void locate(Token * t, const string & file, long long line_delta)
+  void locate(Token * t, const shared_ptr<const string> & file, long long line_delta)
   {
     t->file = file;
     long long line = static_cast<long long>(t->line) + line_delta;
@@ -573,61 +574,107 @@ private:
     return pasted;
   }
 
-  vector<Token> expand(const vector<Token> & input, unsigned depth = 0)
+  enum BuiltinResult { BUILTIN_REPLACED, BUILTIN_NOT_INVOKED, BUILTIN_DEFERRED };
+
+  BuiltinResult expand_builtin(Token & head, const string & name,
+                               const Macro & macro, deque<Token> & work,
+                               bool final, vector<Token> * deferred)
+  {
+    bool known_attribute = false;
+    if (macro.function_like)
+    {
+      size_t open = 0;
+      while (open < work.size() && is_space(work[open])) ++open;
+      if (open >= work.size() && !final)
+      {
+        if (deferred) deferred->push_back(std::move(head));
+        while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
+        return BUILTIN_DEFERRED;
+      }
+      if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].text != "(")
+        return BUILTIN_NOT_INVOKED;
+      vector<vector<Token> > builtin_args; size_t consumed = 0;
+      if (!parse_arguments(work, open, &builtin_args, &consumed))
+      {
+        if (final) throw runtime_error("unterminated builtin macro invocation");
+        work.push_front(std::move(head));
+        while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
+        return BUILTIN_DEFERRED;
+      }
+      for (size_t i = 0; i < consumed; ++i) work.pop_front();
+      if (macro.builtin == Macro::HAS_ATTRIBUTE && !builtin_args.empty())
+      {
+        size_t ai = skip_space(builtin_args[0], 0);
+        if (ai < builtin_args[0].size() && is_identifier(builtin_args[0][ai]) &&
+            (builtin_args[0][ai].text == "no_unique_address" ||
+             builtin_args[0][ai].text == "__no_unique_address__"))
+          known_attribute = true;
+      }
+    }
+    Token replacement;
+    if (macro.builtin == Macro::LINE)
+      replacement = Token(TK_NUMBER, to_string(head.presumed_line), head.line, head.column);
+    else if (macro.builtin == Macro::FILE)
+      replacement = Token(TK_STRING, quote_string(head.file ? *head.file : string()), head.line, head.column);
+    else if (macro.builtin == Macro::DATE)
+      replacement = Token(TK_STRING, macro.replacement.empty() ? date_ : macro.replacement[0].text, head.line, head.column);
+    else if (macro.builtin == Macro::TIME)
+      replacement = Token(TK_STRING, macro.replacement.empty() ? time_ : macro.replacement[0].text, head.line, head.column);
+    else if (macro.builtin == Macro::COUNTER)
+      replacement = Token(TK_NUMBER, to_string(counter_++), head.line, head.column);
+    else
+      replacement = Token(TK_NUMBER, known_attribute ? "201803" : "0", head.line, head.column);
+    replacement.file = head.file; replacement.presumed_line = head.presumed_line;
+    replacement.unavailable = head.unavailable; add_name(&replacement.unavailable, name);
+    replacement.inherited_paint = head.unavailable; replacement.from_macro = true;
+    work.push_front(std::move(replacement));
+    return BUILTIN_REPLACED;
+  }
+
+  vector<Token> expand(vector<Token> input, unsigned depth = 0,
+                       bool * contains_pragma_operator = 0, bool final = true,
+                       vector<Token> * deferred = 0)
   {
     if (depth > 256) throw runtime_error("macro argument expansion nesting limit");
-    deque<Token> work(input.begin(), input.end());
+    bool possible_macro = false, found_pragma_operator = false;
+    for (size_t i = 0; i < input.size(); ++i)
+    {
+      if (is_identifier(input[i]) && input[i].text == "_Pragma") found_pragma_operator = true;
+      if (is_identifier(input[i]) && !contains_name(input[i].unavailable, input[i].text) &&
+          macros_.find(input[i].text) != macros_.end()) possible_macro = true;
+    }
+    if (!possible_macro && (final || !found_pragma_operator))
+    {
+      if (contains_pragma_operator) *contains_pragma_operator = found_pragma_operator;
+      return input;
+    }
+    deque<Token> work;
+    for (size_t i = 0; i < input.size(); ++i) work.push_back(std::move(input[i]));
+    vector<Token>().swap(input);
     vector<Token> output;
     size_t expansions = 0;
     while (!work.empty())
     {
       if (++expansions > 10000000) throw runtime_error("macro expansion work limit");
-      Token head = work.front(); work.pop_front();
+      Token head = std::move(work.front()); work.pop_front();
       if (!is_identifier(head) || contains_name(head.unavailable, head.text))
-      { output.push_back(head); continue; }
+      { output.push_back(std::move(head)); continue; }
+      if (!final && head.text == "_Pragma")
+      {
+        if (deferred) deferred->push_back(std::move(head));
+        while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
+        break;
+      }
       unordered_map<string, Macro>::const_iterator found = macros_.find(head.text);
-      if (found == macros_.end()) { output.push_back(head); continue; }
+      if (found == macros_.end()) { output.push_back(std::move(head)); continue; }
       const string name = head.text;
       const Macro & macro = found->second;
 
       if (macro.builtin != Macro::NONE)
       {
-        bool known_attribute = false;
-        if (macro.function_like)
-        {
-          size_t open = 0;
-          while (open < work.size() && is_space(work[open])) ++open;
-          if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].text != "(")
-          { output.push_back(head); continue; }
-          vector<vector<Token> > builtin_args; size_t consumed = 0;
-          if (!parse_arguments(work, open, &builtin_args, &consumed)) throw runtime_error("unterminated builtin macro invocation");
-          for (size_t i = 0; i < consumed; ++i) work.pop_front();
-          if (macro.builtin == Macro::HAS_ATTRIBUTE && !builtin_args.empty())
-          {
-            size_t ai = skip_space(builtin_args[0], 0);
-            if (ai < builtin_args[0].size() && is_identifier(builtin_args[0][ai]) &&
-                (builtin_args[0][ai].text == "no_unique_address" ||
-                 builtin_args[0][ai].text == "__no_unique_address__"))
-              known_attribute = true;
-          }
-        }
-        Token replacement;
-        if (macro.builtin == Macro::LINE)
-        { replacement = Token(TK_NUMBER, to_string(head.presumed_line), head.line, head.column); }
-        else if (macro.builtin == Macro::FILE)
-        { replacement = Token(TK_STRING, quote_string(head.file), head.line, head.column); }
-        else if (macro.builtin == Macro::DATE)
-        { replacement = Token(TK_STRING, macro.replacement.empty() ? date_ : macro.replacement[0].text, head.line, head.column); }
-        else if (macro.builtin == Macro::TIME)
-        { replacement = Token(TK_STRING, macro.replacement.empty() ? time_ : macro.replacement[0].text, head.line, head.column); }
-        else if (macro.builtin == Macro::COUNTER)
-        { replacement = Token(TK_NUMBER, to_string(counter_++), head.line, head.column); }
-        else
-        { replacement = Token(TK_NUMBER, known_attribute ? "201803" : "0", head.line, head.column); }
-        replacement.file = head.file; replacement.presumed_line = head.presumed_line;
-        replacement.unavailable = head.unavailable; add_name(&replacement.unavailable, name);
-        replacement.inherited_paint = head.unavailable; replacement.from_macro = true;
-        work.push_front(replacement);
+        const BuiltinResult result = expand_builtin(head, name, macro, work, final, deferred);
+        if (result == BUILTIN_NOT_INVOKED) output.push_back(std::move(head));
+        if (result == BUILTIN_DEFERRED) break;
         continue;
       }
 
@@ -639,9 +686,21 @@ private:
       {
         size_t open = 0;
         while (open < work.size() && is_space(work[open])) ++open;
+        if (open >= work.size() && !final)
+        {
+          if (deferred) deferred->push_back(std::move(head));
+          while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
+          break;
+        }
         if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].text != "(")
-        { output.push_back(head); continue; }
-        if (!parse_arguments(work, open, &args, &consumed)) throw runtime_error("unterminated function macro invocation");
+        { output.push_back(std::move(head)); continue; }
+        if (!parse_arguments(work, open, &args, &consumed))
+        {
+          if (final) throw runtime_error("unterminated function macro invocation");
+          work.push_front(std::move(head));
+          while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
+          break;
+        }
         const Paint & closing_paint = work[consumed - 1].unavailable;
         macro_paint = intersect_names(head.unavailable, closing_paint);
         add_name(&macro_paint, name);
@@ -729,7 +788,7 @@ private:
             if (values.empty() && pasted) values.push_back(Token(TK_PLACEMARK, ""));
             else if (!pasted)
             {
-              if (!expanded_ready[ix]) { expanded_args[ix] = expand(values, depth + 1); expanded_ready[ix] = true; }
+              if (!expanded_ready[ix]) { expanded_args[ix] = expand(std::move(values), depth + 1); expanded_ready[ix] = true; }
               values = expanded_args[ix];
             }
             for (size_t q = 0; q < values.size(); ++q)
@@ -787,7 +846,14 @@ private:
             if (pasted[q].kind != TK_PLACEMARK) body.push_back(pasted[q]);
         }
       }
-      for (size_t q = body.size(); q > 0; --q) work.push_front(body[q - 1]);
+      for (size_t q = body.size(); q > 0; --q) work.push_front(std::move(body[q - 1]));
+    }
+    if (contains_pragma_operator)
+    {
+      if (!found_pragma_operator)
+        for (size_t i = 0; i < output.size(); ++i)
+          if (is_identifier(output[i]) && output[i].text == "_Pragma") { found_pragma_operator = true; break; }
+      *contains_pragma_operator = found_pragma_operator;
     }
     return output;
   }
@@ -821,7 +887,7 @@ private:
       }
       else protected_tokens.push_back(expression[i]);
     }
-    vector<Token> expanded = expand(protected_tokens);
+    vector<Token> expanded = expand(std::move(protected_tokens));
     vector<ControlExpressionToken> operands;
     for (size_t i = 0; i < expanded.size(); ++i)
     {
@@ -862,6 +928,10 @@ private:
 
   void execute_pragma_operator(vector<Token> * tokens, const string & fallback_file)
   {
+    bool has_pragma_operator = false;
+    for (size_t i = 0; i < tokens->size(); ++i)
+      if (is_identifier((*tokens)[i]) && (*tokens)[i].text == "_Pragma") { has_pragma_operator = true; break; }
+    if (!has_pragma_operator) return;
     vector<Token> out;
     for (size_t i = 0; i < tokens->size(); ++i)
     {
@@ -878,21 +948,24 @@ private:
       size_t end = skip_space(*tokens, j + 1);
       if (end >= tokens->size() || (*tokens)[end].kind != TK_PUNCT || (*tokens)[end].text != ")")
         throw runtime_error("invalid _Pragma invocation");
-      if (pragma == "once") mark_pragma_once(t.file.empty() ? fallback_file : t.file);
+      if (pragma == "once") mark_pragma_once(t.file ? *t.file : fallback_file);
       i = end;
     }
     tokens->swap(out);
   }
 
-  void emit_text(vector<Token> & tokens, const string & file)
+  void emit_text(vector<Token> & tokens, const string & file, bool final = true,
+                 vector<Token> * deferred = 0)
   {
     if (tokens.empty()) return;
-    vector<Token> expanded = expand(tokens);
-    execute_pragma_operator(&expanded, file);
+    bool has_pragma_operator = false;
+    vector<Token> expanded = expand(std::move(tokens), 0, &has_pragma_operator,
+                                    final, deferred);
+    if (final && has_pragma_operator) execute_pragma_operator(&expanded, file);
     for (size_t i = 0; i < expanded.size(); ++i)
     {
       const Token & t = expanded[i];
-      post_->set_source_file(t.file);
+      post_->set_source_file(t.file ? *t.file : string());
       post_->set_source_location(t.presumed_line, t.column);
       switch (t.kind)
       {
@@ -911,12 +984,11 @@ private:
         case TK_PLACEMARK: break;
       }
     }
-    tokens.clear();
   }
 
   string include_path(const string & current, const vector<Token> & args)
   {
-    vector<Token> expanded = expand(args);
+    vector<Token> expanded = expand(std::move(args));
     size_t start = skip_space(expanded, 0), end = expanded.size();
     while (end && is_space(expanded[end - 1])) --end;
     if (start >= end) throw runtime_error("empty include operand");
@@ -959,13 +1031,15 @@ private:
     Preprocessor & owner;
     unsigned include_depth;
     string presumed_file;
+    shared_ptr<const string> presumed_file_ref;
     long long line_delta;
     size_t line, column, physical_end_line;
     vector<Token> current, pending_text;
     vector<Conditional> conditions;
 
     FileStream(Preprocessor & p, const string & path, unsigned depth)
-      : owner(p), include_depth(depth), presumed_file(path), line_delta(0),
+      : owner(p), include_depth(depth), presumed_file(path),
+        presumed_file_ref(new string(path)), line_delta(0),
         line(1), column(1), physical_end_line(1) {}
 
     void set_source_line(size_t l) { line = l; column = 1; }
@@ -1022,7 +1096,7 @@ private:
 void Preprocessor::process_line(Preprocessor::FileStream & file)
   {
     vector<Token> & line = file.current;
-    for (size_t i = 0; i < line.size(); ++i) locate(&line[i], file.presumed_file, file.line_delta);
+    for (size_t i = 0; i < line.size(); ++i) locate(&line[i], file.presumed_file_ref, file.line_delta);
     size_t first = skip_space(line, 0);
     const bool is_directive = first < line.size() && is_punct(line[first], "#");
     if (!is_directive)
@@ -1030,9 +1104,14 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
       const bool enabled = file.conditions.empty() || file.conditions.back().active;
       if (enabled)
       {
-        file.pending_text.insert(file.pending_text.end(), line.begin(), line.end());
-        file.pending_text.push_back(Token(TK_SPACE));
-        locate(&file.pending_text.back(), file.presumed_file, file.line_delta);
+        vector<Token> candidate = std::move(file.pending_text);
+        for (size_t i = 0; i < line.size(); ++i)
+          candidate.push_back(std::move(line[i]));
+        candidate.push_back(Token(TK_SPACE));
+        locate(&candidate.back(), file.presumed_file_ref, file.line_delta);
+        vector<Token> deferred;
+        emit_text(candidate, file.presumed_file, false, &deferred);
+        file.pending_text = std::move(deferred);
       }
       return;
     }
@@ -1109,14 +1188,14 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
     }
     else if (directive == "include")
     {
-      const string header = include_path(file.presumed_file, args);
+      const string header = include_path(file.presumed_file, std::move(args));
       PreprocessorFileId id;
       if (GetPreprocessorFileId(header, id) && once_.find(id) != once_.end()) return;
       process_file(header, file.include_depth + 1);
     }
     else if (directive == "line")
     {
-      vector<Token> expanded = expand(args);
+      vector<Token> expanded = expand(std::move(args));
       size_t a = skip_space(expanded, 0);
       if (a >= expanded.size() || expanded[a].kind != TK_NUMBER) throw runtime_error("invalid #line number");
       char * tail = 0;
@@ -1131,6 +1210,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         string filename;
         if (!decode_string_literal(expanded[b].text, &filename)) throw runtime_error("invalid #line filename");
         file.presumed_file = filename;
+        file.presumed_file_ref.reset(new string(filename));
       }
       else if (b != expanded.size()) throw runtime_error("invalid #line tokens");
       const size_t physical_next = file.physical_end_line + 1;
