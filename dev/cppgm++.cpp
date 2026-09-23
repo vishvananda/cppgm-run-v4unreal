@@ -366,7 +366,7 @@ int run_emit_ast_mode(const vector<string> &args) {
   }
   out << inputs.size() << " translation units\n";
   for (size_t unit = 0; unit < inputs.size(); ++unit) {
-    vector<PostTokenRecord> records;
+    PostTokenBuffer records;
     bool invalid = false;
     unique_ptr<IPPTokenStream> collector =
         create_posttoken_collector(records, &invalid);
@@ -378,7 +378,7 @@ int run_emit_ast_mode(const vector<string> &args) {
     }
     out << "start translation unit " << (unit + 1) << "\n";
     size_t end = 0;
-    while (end < records.size() && records[end].kind != "eof") {
+    while (end < records.size() && records[end].kind != PostTokenEof) {
       ++end;
     }
     parse_and_dump_translation_unit(records, 0, end, out);

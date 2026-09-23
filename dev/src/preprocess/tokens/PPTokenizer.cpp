@@ -402,7 +402,7 @@ public:
       if (cp == '\n')
       {
         const Unit newline = take();
-        output_.set_source_location(newline.line, newline.column);
+        output_.set_source_position(newline.begin, newline.line, newline.column);
         output_.emit_new_line();
         line_start_ = true;
         directive_ = 0;
@@ -418,7 +418,7 @@ public:
       if (directive_ == 2 && (cp == '<' || cp == '"'))
       {
         const std::string header = scan_header_name();
-        output_.set_source_location(start.line, start.column);
+        output_.set_source_position(start.begin, start.line, start.column);
         output_.emit_header_name(header);
         finish_token(3, false, std::string());
         continue;
@@ -433,7 +433,7 @@ public:
         std::string suffix;
         const bool user_defined = scan_ud_suffix(&suffix);
         spelling += suffix;
-        output_.set_source_location(start.line, start.column);
+        output_.set_source_position(start.begin, start.line, start.column);
         if (string_start.quote == '\'')
         {
           if (user_defined)
@@ -470,7 +470,7 @@ public:
             alternative = true;
             break;
           }
-        output_.set_source_location(start.line, start.column);
+        output_.set_source_position(start.begin, start.line, start.column);
         if (alternative)
           output_.emit_preprocessing_op_or_punc(identifier);
         else
@@ -482,7 +482,7 @@ public:
       if (is_digit(cp) || (cp == '.' && is_digit(peek(1).cp)))
       {
         const std::string number = scan_pp_number();
-        output_.set_source_location(start.line, start.column);
+        output_.set_source_position(start.begin, start.line, start.column);
         output_.emit_pp_number(number);
         finish_token(0, false, std::string());
         continue;
@@ -491,7 +491,7 @@ public:
       std::string op;
       if (scan_operator(&op))
       {
-        output_.set_source_location(start.line, start.column);
+        output_.set_source_position(start.begin, start.line, start.column);
         output_.emit_preprocessing_op_or_punc(op);
         finish_token(0, false, op);
         continue;
@@ -502,7 +502,7 @@ public:
         throw std::runtime_error("unterminated quoted preprocessing token");
       std::string data;
       append_utf8(data_cp, &data);
-      output_.set_source_location(start.line, start.column);
+      output_.set_source_position(start.begin, start.line, start.column);
       output_.emit_non_whitespace_char(data);
       finish_token(0, false, std::string());
     }
@@ -600,13 +600,13 @@ private:
 
   void emit_whitespace(const Unit & start)
   {
-    output_.set_source_location(start.line, start.column);
+    output_.set_source_position(start.begin, start.line, start.column);
     output_.emit_whitespace_sequence();
   }
 
   void emit_comment_newline(const Unit & newline)
   {
-    output_.set_source_location(newline.line, newline.column);
+    output_.set_source_position(newline.begin, newline.line, newline.column);
     output_.emit_comment_new_line();
     line_start_ = true;
     directive_ = 0;

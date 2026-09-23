@@ -268,14 +268,14 @@ struct Token
   const IdentifierTable * identifier_table;
   uint32_t identifier_id;
   uint32_t file_id;
-  size_t line, column, presumed_line;
+  size_t line, column, presumed_line, source_offset;
   Paint unavailable;
   Paint inherited_paint;
   bool from_macro;
   bool paste_operator, stringize_operator;
   Token(TokenKind k = TK_OTHER, const string & s = string(), size_t l = 1,
-        size_t c = 1) : kind(k), text_storage(s), identifier_table(0),
-                         identifier_id(0), file_id(0), line(l), column(c), presumed_line(l),
+        size_t c = 1, size_t offset = 0) : kind(k), text_storage(s), identifier_table(0),
+                         identifier_id(0), file_id(0), line(l), column(c), presumed_line(l), source_offset(offset),
                          unavailable(0), inherited_paint(0), from_macro(false), paste_operator(false), stringize_operator(false) {}
   const string & spelling() const
   {
@@ -828,6 +828,7 @@ private:
       result.text_storage.clear();
     }
     result.file_id = head.file_id; result.line = head.line; result.presumed_line = head.presumed_line;
+    result.source_offset = head.source_offset;
     result.unavailable = paints_.unite(left.unavailable, right.unavailable);
     result.inherited_paint = head.unavailable;
     result.from_macro = true;
@@ -919,6 +920,7 @@ private:
     else
       replacement = Token(TK_NUMBER, known_attribute ? "201803" : "0", head.line, head.column);
     replacement.file_id = head.file_id; replacement.presumed_line = head.presumed_line;
+    replacement.source_offset = head.source_offset;
     replacement.unavailable = paints_.insert(head.unavailable, macro_id);
     replacement.inherited_paint = head.unavailable; replacement.from_macro = true;
     work.push_front(std::move(replacement));
@@ -1056,6 +1058,7 @@ private:
             }
             Token stringized(TK_STRING, string("\"") + content + "\"", head.line, head.column);
             stringized.file_id = head.file_id; stringized.presumed_line = head.presumed_line;
+            stringized.source_offset = head.source_offset;
             stringized.unavailable = macro_paint;
             stringized.inherited_paint = head.unavailable; stringized.from_macro = true;
             substituted.push_back(stringized); ri = pi;
@@ -1114,6 +1117,7 @@ private:
           }
           Token copy = rt;
           copy.file_id = head.file_id; copy.line = head.line; copy.column = head.column;
+          copy.source_offset = head.source_offset;
           copy.presumed_line = head.presumed_line;
           copy.unavailable = macro_paint;
           copy.inherited_paint = head.unavailable; copy.from_macro = true;
@@ -1129,6 +1133,7 @@ private:
         for (size_t q = 0; q < body.size(); ++q)
         {
           body[q].file_id = head.file_id; body[q].line = head.line; body[q].column = head.column;
+          body[q].source_offset = head.source_offset;
           body[q].presumed_line = head.presumed_line;
           body[q].unavailable = paints_.insert(head.unavailable, macro_id);
           body[q].inherited_paint = head.unavailable; body[q].from_macro = true;
@@ -1181,6 +1186,7 @@ private:
         }
         Token value(TK_NUMBER, exists ? "1" : "0", expression[i].line, expression[i].column);
         value.file_id = expression[i].file_id; value.presumed_line = expression[i].presumed_line;
+        value.source_offset = expression[i].source_offset;
         protected_tokens.push_back(value); i = j - 1;
       }
       else protected_tokens.push_back(expression[i]);
@@ -1264,7 +1270,7 @@ private:
     {
       const Token & t = expanded[i];
       post_->set_source_file(file_name(t.file_id));
-      post_->set_source_location(t.presumed_line, t.column);
+      post_->set_source_position(t.source_offset, t.presumed_line, t.column);
       switch (t.kind)
       {
         case TK_SPACE: case TK_NEWLINE: post_->emit_whitespace_sequence(); break;
@@ -1332,17 +1338,19 @@ private:
     string presumed_file;
     uint32_t file_id;
     long long line_delta;
-    size_t line, column, physical_end_line;
+    size_t line, column, source_offset, physical_end_line;
     vector<Token> current, pending_text;
     vector<Conditional> conditions;
 
     FileStream(Preprocessor & p, const string & path, unsigned depth)
       : owner(p), include_depth(depth), presumed_file(path),
         file_id(p.intern_file(path)), line_delta(0),
-        line(1), column(1), physical_end_line(1) {}
+        line(1), column(1), source_offset(0), physical_end_line(1) {}
 
     void set_source_line(size_t l) { line = l; column = 1; }
     void set_source_location(size_t l, size_t c) { line = l; column = c; }
+    void set_source_position(size_t offset, size_t l, size_t c)
+      { source_offset = offset; line = l; column = c; }
     void emit_whitespace_sequence() { add(TK_SPACE, ""); }
     void emit_new_line()
     {
@@ -1378,7 +1386,7 @@ private:
   private:
     void add(TokenKind kind, const string & spelling)
     {
-      Token token(kind, string(), line, column);
+      Token token(kind, string(), line, column, source_offset);
       if (kind == TK_IDENTIFIER)
       {
         token.identifier_table = &owner.identifiers_;
@@ -1395,9 +1403,12 @@ private:
     if (include_depth > 128) throw runtime_error("include nesting limit");
     ifstream in(path.c_str(), ios::binary);
     if (!in) throw runtime_error("cannot open source file");
-    const string source((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    const shared_ptr<const string> source(new string(
+        (istreambuf_iterator<char>(in)), istreambuf_iterator<char>()));
+    if (post_)
+      post_->retain_source_buffer(path, source);
     FileStream stream(*this, path, include_depth);
-    PPTokenizer tokenizer(source, stream);
+    PPTokenizer tokenizer(*source, stream);
     tokenizer.tokenize();
     stream.finish();
   }

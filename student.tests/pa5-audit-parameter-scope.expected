@@ -1,0 +1,125 @@
+1 translation units
+start translation unit 1
+translation-unit
+  class-specifier C
+    class-key KW_STRUCT:struct
+  class-specifier Base
+    class-key KW_STRUCT:struct
+    special-member-declaration Base
+      declarator
+        identifier Base
+        parameter-clause
+          parameter-declaration
+            decl-specifier-seq
+              decl-specifier KW_INT:int
+  class-specifier D
+    class-key KW_STRUCT:struct
+    base-clause
+      base-specifier
+        base-name Base
+    special-member-definition D
+      declarator
+        identifier D
+        parameter-clause
+          parameter-declaration
+            decl-specifier-seq
+              decl-specifier KW_INT:int
+            declarator
+              identifier C
+      ctor-initializer
+        mem-initializer
+          mem-initializer-id Base
+          paren-argument-list
+            id-expression C
+      compound-statement
+    function-definition
+      decl-specifier-seq
+        decl-specifier KW_INT:int
+      declarator
+        identifier f
+        parameter-clause
+          parameter-declaration
+            decl-specifier-seq
+              decl-specifier KW_INT:int
+            declarator
+              identifier x
+      compound-statement
+        return-statement
+          id-expression x
+  simple-declaration
+    decl-specifier-seq
+      decl-specifier TT_IDENTIFIER:C
+    init-declarator-list
+      init-declarator
+        declarator
+          identifier after_member_parameter
+  function-definition
+    decl-specifier-seq
+      decl-specifier KW_INT:int
+    declarator
+      identifier g
+      parameter-clause
+        parameter-declaration
+          decl-specifier-seq
+            decl-specifier KW_INT:int
+          declarator
+            identifier C
+    compound-statement
+      return-statement
+        id-expression C
+  simple-declaration
+    decl-specifier-seq
+      decl-specifier TT_IDENTIFIER:C
+    init-declarator-list
+      init-declarator
+        declarator
+          identifier after_function_parameter
+  simple-declaration
+    decl-specifier-seq
+      decl-specifier KW_AUTO:auto
+    init-declarator-list
+      init-declarator
+        declarator
+          identifier lambda
+        initializer
+          lambda-expression
+            lambda-introducer []
+            lambda-declarator
+              parameter-clause
+                parameter-declaration
+                  decl-specifier-seq
+                    decl-specifier KW_INT:int
+                  declarator
+                    identifier C
+            compound-statement
+              return-statement
+                id-expression C
+  simple-declaration
+    decl-specifier-seq
+      decl-specifier TT_IDENTIFIER:C
+    init-declarator-list
+      init-declarator
+        declarator
+          identifier after_lambda_parameter
+  class-specifier Holder
+    class-key KW_STRUCT:struct
+    simple-declaration
+      decl-specifier-seq
+        decl-specifier KW_TYPEDEF:typedef
+        decl-specifier KW_INT:int
+      init-declarator-list
+        init-declarator
+          declarator
+            identifier hidden_type
+  function-definition
+    decl-specifier-seq
+      decl-specifier KW_VOID:void
+    declarator
+      identifier outside_class_scope
+      parameter-clause
+    compound-statement
+      expression-statement
+        binary-expression OP_STAR:*
+          id-expression hidden_type
+          id-expression pointer
+end translation unit

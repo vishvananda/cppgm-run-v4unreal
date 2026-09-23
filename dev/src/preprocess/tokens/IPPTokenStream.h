@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <string>
 
 struct IPPTokenStream
@@ -11,9 +12,18 @@ struct IPPTokenStream
 	// each spelling or new-line event and reports the physical source line of
 	// that event; legacy PA1-PA4 consumers intentionally need no location state.
 	virtual void set_source_file(const std::string& file) { (void)file; }
+	virtual void retain_source_buffer(
+		const std::string& file,
+		const std::shared_ptr<const std::string>& source)
+		{ (void)file; (void)source; }
 	virtual void set_source_line(std::size_t line) { (void)line; }
 	virtual void set_source_location(std::size_t line, std::size_t column)
 		{ set_source_line(line); (void)column; }
+	// Tokenizers with immutable byte offsets can provide a compact source
+	// location. Legacy stages retain their existing line/column callbacks.
+	virtual void set_source_position(std::size_t offset, std::size_t line,
+					 std::size_t column)
+		{ (void)offset; set_source_location(line, column); }
 	virtual void emit_whitespace_sequence() = 0;
 	virtual void emit_new_line() = 0;
 	// Phase-4 consumers may treat physical newlines inside a comment as trivia

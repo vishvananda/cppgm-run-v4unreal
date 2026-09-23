@@ -32,6 +32,114 @@
 using namespace std;
 
 namespace {
+std::uint64_t posttoken_hash(const std::string &text) {
+  std::uint64_t hash = UINT64_C(1469598103934665603);
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    hash ^= static_cast<unsigned char>(text[i]);
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+} // namespace
+
+bool PostTokenBuffer::find_spelling(const std::string &text,
+                                    std::uint32_t *id) const {
+  if (spelling_index_.empty()) return false;
+  const std::uint64_t hash = posttoken_hash(text);
+  std::size_t slot = static_cast<std::size_t>(hash) &
+                     (spelling_index_.size() - 1);
+  while (spelling_index_[slot].occupied) {
+    if (spelling_index_[slot].hash == hash &&
+        spellings_[spelling_index_[slot].id] == text) {
+      if (id) *id = spelling_index_[slot].id;
+      return true;
+    }
+    slot = (slot + 1) & (spelling_index_.size() - 1);
+  }
+  return false;
+}
+
+std::uint32_t PostTokenBuffer::intern(std::vector<std::string> &values,
+                                     std::vector<InternSlot> &index,
+                                     const std::string &text) {
+  const std::uint64_t hash = posttoken_hash(text);
+  if (index.empty())
+    index.resize(16);
+  std::size_t slot = static_cast<std::size_t>(hash) & (index.size() - 1);
+  while (index[slot].occupied) {
+    if (index[slot].hash == hash && values[index[slot].id] == text)
+      return index[slot].id;
+    slot = (slot + 1) & (index.size() - 1);
+  }
+  if (values.size() >= std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("post-token intern table exhausted");
+  if ((values.size() + 1) * 10 >= index.size() * 7) {
+    const std::vector<InternSlot> old(index);
+    index.assign(old.size() * 2, InternSlot());
+    for (std::size_t i = 0; i < old.size(); ++i) {
+      if (!old[i].occupied) continue;
+      std::size_t at = static_cast<std::size_t>(old[i].hash) & (index.size() - 1);
+      while (index[at].occupied)
+        at = (at + 1) & (index.size() - 1);
+      index[at] = old[i];
+    }
+    slot = static_cast<std::size_t>(hash) & (index.size() - 1);
+    while (index[slot].occupied)
+      slot = (slot + 1) & (index.size() - 1);
+  }
+  const std::uint32_t id = static_cast<std::uint32_t>(values.size());
+  values.push_back(text);
+  index[slot].hash = hash;
+  index[slot].id = id;
+  index[slot].occupied = true;
+  return id;
+}
+
+std::uint32_t PostTokenBuffer::intern_file(const std::string &file) {
+  if (has_cached_file_ && cached_file_name_ == file)
+    return cached_file_id_;
+  cached_file_id_ = intern(files_, file_index_, file);
+  cached_file_name_ = file;
+  has_cached_file_ = true;
+  return cached_file_id_;
+}
+
+void PostTokenBuffer::retain_source_buffer(
+    const std::string &file, const std::shared_ptr<const std::string> &source) {
+  const std::uint32_t file_id = intern_file(file);
+  if (source_buffers_.size() <= file_id)
+    source_buffers_.resize(static_cast<std::size_t>(file_id) + 1);
+  if (!source_buffers_[file_id])
+    source_buffers_[file_id] = source;
+}
+
+std::vector<PostTokenSourceFile> PostTokenBuffer::take_source_files() {
+  std::vector<PostTokenSourceFile> result;
+  result.reserve(files_.size());
+  for (std::size_t i = 0; i < files_.size(); ++i) {
+    PostTokenSourceFile file;
+    file.path = files_[i];
+    if (i < source_buffers_.size())
+      file.contents = std::move(source_buffers_[i]);
+    result.push_back(std::move(file));
+  }
+  return result;
+}
+
+void PostTokenBuffer::append(PostTokenKind kind, const std::string &text,
+                             const std::string &source_file,
+                             std::size_t line, std::size_t column,
+                             std::size_t source_offset) {
+  if (line > std::numeric_limits<std::uint32_t>::max() ||
+      column > std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("post-token source location is out of range");
+  const std::uint32_t spelling_id = intern(spellings_, spelling_index_, text);
+  const std::uint32_t file_id = intern_file(source_file);
+  records_.push_back(PostTokenRecord(kind, spelling_id, file_id, line, column,
+                                     source_offset));
+}
+
+namespace {
 
 
 // See 3.9.1: Fundamental Types
@@ -568,14 +676,36 @@ string HexDump(const void* pdata, size_t nbytes)
 struct DebugPostTokenOutputStream
 {
   explicit DebugPostTokenOutputStream(std::ostream * output, bool * invalid,
-                                      vector<PostTokenRecord> * records = 0)
-    : output_(output), saw_invalid_(invalid), records_(records)
-    { pending_.reserve(65536); }
+                                      PostTokenBuffer * records = 0)
+    : output_(output), saw_invalid_(invalid), records_(records), line_(0),
+      column_(0), source_offset_(0) { pending_.reserve(65536); }
   std::ostream * output_;
   bool * saw_invalid_;
-  vector<PostTokenRecord> * records_;
-  void record(const string & kind, const string & source)
-    { if (records_) records_->push_back(PostTokenRecord(kind, source)); }
+  PostTokenBuffer * records_;
+  string source_file_;
+  size_t line_, column_, source_offset_;
+  void set_source_file(const string &file) {
+    if (source_file_ != file) source_file_ = file;
+  }
+  void retain_source_buffer(const string &file,
+                            const shared_ptr<const string> &source) {
+    if (records_) records_->retain_source_buffer(file, source);
+  }
+  void set_source_location(size_t line, size_t column)
+    { line_ = line; column_ = column; }
+  void set_source_position(size_t offset, size_t line, size_t column)
+    { source_offset_ = offset; line_ = line; column_ = column; }
+  void record(const string &kind, const string &source) {
+    if (!records_) return;
+    PostTokenKind token_kind = PostTokenInvalid;
+    if (kind == "identifier") token_kind = PostTokenIdentifier;
+    else if (kind == "simple") token_kind = PostTokenSimple;
+    else if (kind == "literal") token_kind = PostTokenLiteral;
+    else if (kind == "user-defined-literal") token_kind = PostTokenUserDefinedLiteral;
+    else if (kind == "eof") token_kind = PostTokenEof;
+    records_->append(token_kind, source, source_file_, line_, column_,
+                     source_offset_);
+  }
 
   void emit_invalid(const string& source)
   {
@@ -1466,8 +1596,31 @@ class PostTokenStream : public IPPTokenStream
 {
 public:
   explicit PostTokenStream(DebugPostTokenOutputStream & output)
-    : output_(output), after_operator_keyword_(false) {}
+    : output_(output), after_operator_keyword_(false), current_line_(0),
+      current_column_(0), current_offset_(0), string_line_(0),
+      string_column_(0), string_offset_(0) {}
 
+  void set_source_file(const string &file) {
+    if (current_file_ != file) {
+      current_file_ = file;
+      output_.set_source_file(file);
+    }
+  }
+  void retain_source_buffer(const string &file,
+                            const shared_ptr<const string> &source) {
+    output_.retain_source_buffer(file, source);
+  }
+  void set_source_location(size_t line, size_t column) {
+    current_line_ = line;
+    current_column_ = column;
+    output_.set_source_location(line, column);
+  }
+  void set_source_position(size_t offset, size_t line, size_t column) {
+    current_offset_ = offset;
+    current_line_ = line;
+    current_column_ = column;
+    output_.set_source_position(offset, line, column);
+  }
   void emit_whitespace_sequence() {}
   void emit_new_line() {}
   void emit_header_name(const string & data)
@@ -1487,13 +1640,15 @@ public:
   void emit_user_defined_character_literal(const string & data)
     { after_operator_keyword_ = false; flush_strings(); posttoken_character(data, true, output_); }
   void emit_string_literal(const string & data)
-    { after_operator_keyword_ = false; strings_.push_back(StringPiece(data, false)); }
+    { after_operator_keyword_ = false; remember_string_location();
+      strings_.push_back(StringPiece(data, false)); }
   void emit_user_defined_string_literal(const string & data)
   {
     if (after_operator_keyword_ && data.size() > 2 && data.compare(0, 2, "\"\"") == 0)
     {
       const string suffix = data.substr(2);
       after_operator_keyword_ = false;
+      remember_string_location();
       strings_.push_back(StringPiece("\"\"", false));
       flush_strings();
       ETokenType type;
@@ -1502,6 +1657,7 @@ public:
       return;
     }
     after_operator_keyword_ = false;
+    remember_string_location();
     strings_.push_back(StringPiece(data, true));
   }
   void emit_preprocessing_op_or_punc(const string & data)
@@ -1525,11 +1681,26 @@ private:
   DebugPostTokenOutputStream & output_;
   vector<StringPiece> strings_;
   bool after_operator_keyword_;
+  string current_file_, string_file_;
+  size_t current_line_, current_column_, current_offset_;
+  size_t string_line_, string_column_, string_offset_;
+  void remember_string_location() {
+    if (strings_.empty()) {
+      string_file_ = current_file_;
+      string_line_ = current_line_;
+      string_column_ = current_column_;
+      string_offset_ = current_offset_;
+    }
+  }
   void flush_strings()
   {
     if (strings_.empty()) return;
+    output_.set_source_file(string_file_);
+    output_.set_source_position(string_offset_, string_line_, string_column_);
     posttoken_string_run(strings_, output_);
     strings_.clear();
+    output_.set_source_file(current_file_);
+    output_.set_source_position(current_offset_, current_line_, current_column_);
   }
 };
 
@@ -1538,9 +1709,15 @@ class PostTokenAdapter : public IPPTokenStream
 public:
   PostTokenAdapter(std::ostream & output, bool * invalid)
     : output_(&output, invalid), stream_(output_) {}
-  void set_source_line(std::size_t line) { (void)line; }
+  void set_source_file(const std::string &file) { stream_.set_source_file(file); }
+  void retain_source_buffer(const std::string &file,
+                            const std::shared_ptr<const std::string> &source)
+    { stream_.retain_source_buffer(file, source); }
+  void set_source_line(std::size_t line) { stream_.set_source_location(line, 1); }
   void set_source_location(std::size_t line, std::size_t column)
-    { (void)line; (void)column; }
+    { stream_.set_source_location(line, column); }
+  void set_source_position(std::size_t offset, std::size_t line, std::size_t column)
+    { stream_.set_source_position(offset, line, column); }
   void emit_whitespace_sequence() { stream_.emit_whitespace_sequence(); }
   void emit_new_line() { stream_.emit_new_line(); }
   void emit_header_name(const std::string & s) { stream_.emit_header_name(s); }
@@ -1561,11 +1738,17 @@ private:
 class PostTokenCollectorAdapter : public IPPTokenStream
 {
 public:
-  PostTokenCollectorAdapter(vector<PostTokenRecord> & records, bool * invalid)
+  PostTokenCollectorAdapter(PostTokenBuffer &records, bool *invalid)
     : output_(0, invalid, &records), stream_(output_) {}
-  void set_source_line(std::size_t line) { (void)line; }
+  void set_source_file(const std::string &file) { stream_.set_source_file(file); }
+  void retain_source_buffer(const std::string &file,
+                            const std::shared_ptr<const std::string> &source)
+    { stream_.retain_source_buffer(file, source); }
+  void set_source_line(std::size_t line) { stream_.set_source_location(line, 1); }
   void set_source_location(std::size_t line, std::size_t column)
-    { (void)line; (void)column; }
+    { stream_.set_source_location(line, column); }
+  void set_source_position(std::size_t offset, std::size_t line, std::size_t column)
+    { stream_.set_source_position(offset, line, column); }
   void emit_whitespace_sequence() { stream_.emit_whitespace_sequence(); }
   void emit_new_line() { stream_.emit_new_line(); }
   void emit_header_name(const std::string & s) { stream_.emit_header_name(s); }
@@ -1591,9 +1774,10 @@ std::unique_ptr<IPPTokenStream> create_posttoken_stream(std::ostream & output,
 }
 
 std::unique_ptr<IPPTokenStream> create_posttoken_collector(
-    vector<PostTokenRecord> & records, bool * saw_invalid)
+    PostTokenBuffer &records, bool *saw_invalid)
 {
-  return unique_ptr<IPPTokenStream>(new PostTokenCollectorAdapter(records, saw_invalid));
+  return unique_ptr<IPPTokenStream>(
+      new PostTokenCollectorAdapter(records, saw_invalid));
 }
 
 void run_posttoken_tool(std::istream & input, std::ostream & output)
