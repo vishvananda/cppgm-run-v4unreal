@@ -1,0 +1,13 @@
+0xFFFFFFFFFFFFFFFFULL;
+0x100000000000000000000_id1;
+9223372036854775808;
+18446744073709551616;
+'\x7f'; '\x80'; u'\xD800'; U'\U0010FFFF'; 'ab'; '';
+"\x3C0" u"";
+"π" u"";
+u"\U0001D11E";
+"\x100"; u"\x100";
+R"tag(raw \\n value)tag";
+"abc"_same "def"_same;
+"abc"_one "def"_two;
+operator""sv;

@@ -1,0 +1,41 @@
+literal 0xFFFFFFFFFFFFFFFFULL unsigned long long int FFFFFFFFFFFFFFFF
+simple ; OP_SEMICOLON
+user-defined-literal 0x100000000000000000000_id1 _id1 integer 0x100000000000000000000
+simple ; OP_SEMICOLON
+invalid 9223372036854775808
+simple ; OP_SEMICOLON
+invalid 18446744073709551616
+simple ; OP_SEMICOLON
+literal '\x7f' char 7F
+simple ; OP_SEMICOLON
+literal '\x80' int 80000000
+simple ; OP_SEMICOLON
+invalid u'\xD800'
+simple ; OP_SEMICOLON
+literal U'􏿿' char32_t FFFF1000
+simple ; OP_SEMICOLON
+invalid 'ab'
+simple ; OP_SEMICOLON
+invalid ''
+simple ; OP_SEMICOLON
+literal "\x3C0" u"" array of 2 char16_t C0030000
+simple ; OP_SEMICOLON
+literal "π" u"" array of 2 char16_t C0030000
+simple ; OP_SEMICOLON
+literal u"𝄞" array of 3 char16_t 34D81EDD0000
+simple ; OP_SEMICOLON
+invalid "\x100"
+simple ; OP_SEMICOLON
+literal u"\x100" array of 2 char16_t 00010000
+simple ; OP_SEMICOLON
+literal R"tag(raw \\n value)tag" array of 14 char 726177205C5C6E2076616C756500
+simple ; OP_SEMICOLON
+user-defined-literal "abc"_same "def"_same _same string array of 7 char 61626364656600
+simple ; OP_SEMICOLON
+invalid "abc"_one "def"_two
+simple ; OP_SEMICOLON
+simple operator KW_OPERATOR
+literal "" array of 1 char 00
+identifier sv
+simple ; OP_SEMICOLON
+eof

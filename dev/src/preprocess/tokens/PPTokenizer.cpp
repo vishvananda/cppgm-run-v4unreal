@@ -839,7 +839,6 @@ private:
     if (peek(0).cp != start.quote)
       throw std::logic_error("quoted literal prefix changed during scan");
     append_utf8(take().cp, &spelling);
-    bool has_content = false;
     for (;;)
     {
       const int cp = peek(0).cp;
@@ -847,8 +846,6 @@ private:
         throw std::runtime_error("unterminated string or character literal");
       if (cp == start.quote)
       {
-        if (start.quote == '\'' && !has_content)
-          throw std::runtime_error("empty character literal");
         append_utf8(take().cp, &spelling);
         return spelling;
       }
@@ -858,19 +855,16 @@ private:
         if (ucn.present)
         {
           append_utf8(take_logical(), &spelling);
-          has_content = true;
         }
         else
         {
           spelling.push_back('\\');
           consume_escape(&spelling);
-          has_content = true;
         }
       }
       else
       {
         append_utf8(take().cp, &spelling);
-        has_content = true;
       }
     }
   }
