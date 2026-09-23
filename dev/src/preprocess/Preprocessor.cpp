@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
@@ -52,10 +53,52 @@ struct PaintNode
     : name(n), priority(p), left(l), right(r), size(1 + (l ? l->size : 0) + (r ? r->size : 0)) {}
 };
 
+class IdentifierTable
+{
+public:
+  IdentifierTable() : next_recent_(0)
+  {
+    for (size_t i = 0; i < 8; ++i) recent_[i].valid = false;
+  }
+  uint32_t intern(const string & spelling)
+  {
+    for (size_t i = 0; i < 8; ++i)
+      if (recent_[i].valid && recent_[i].spelling == spelling) return recent_[i].id;
+    unordered_map<string, uint32_t>::const_iterator found = ids_.find(spelling);
+    uint32_t id;
+    if (found != ids_.end()) id = found->second;
+    else
+    {
+      id = static_cast<uint32_t>(names_.size());
+      pair<unordered_map<string, uint32_t>::iterator, bool> inserted =
+        ids_.insert(make_pair(spelling, id));
+      names_.push_back(&inserted.first->first);
+    }
+    recent_[next_recent_].spelling = spelling;
+    recent_[next_recent_].id = id;
+    recent_[next_recent_].valid = true;
+    next_recent_ = (next_recent_ + 1) % 8;
+    return id;
+  }
+  const string & spelling(uint32_t id) const
+  {
+    static const string empty;
+    return id < names_.size() ? *names_[id] : empty;
+  }
+private:
+  struct Recent { string spelling; uint32_t id; bool valid; };
+  unordered_map<string, uint32_t> ids_;
+  vector<const string *> names_;
+  Recent recent_[8];
+  size_t next_recent_;
+};
+
 struct Token
 {
   TokenKind kind;
-  string text;
+  string text_storage;
+  const IdentifierTable * identifier_table;
+  uint32_t identifier_id;
   shared_ptr<const string> file;
   size_t line, column, presumed_line;
   Paint unavailable;
@@ -63,8 +106,14 @@ struct Token
   bool from_macro;
   bool paste_operator, stringize_operator;
   Token(TokenKind k = TK_OTHER, const string & s = string(), size_t l = 1,
-        size_t c = 1) : kind(k), text(s), line(l), column(c), presumed_line(l),
+        size_t c = 1) : kind(k), text_storage(s), identifier_table(0),
+                         identifier_id(0), line(l), column(c), presumed_line(l),
                          from_macro(false), paste_operator(false), stringize_operator(false) {}
+  const string & spelling() const
+  {
+    return kind == TK_IDENTIFIER && identifier_table
+      ? identifier_table->spelling(identifier_id) : text_storage;
+  }
 };
 
 unsigned paint_priority(const string & name)
@@ -163,8 +212,8 @@ bool is_space(const Token & t) { return t.kind == TK_SPACE || t.kind == TK_NEWLI
 bool is_identifier(const Token & t) { return t.kind == TK_IDENTIFIER; }
 bool is_punct(const Token & t, const string & s)
 {
-  return t.kind == TK_PUNCT && (t.text == s ||
-    (s == "#" && t.text == "%:") || (s == "##" && t.text == "%:%:"));
+  return t.kind == TK_PUNCT && (t.spelling() == s ||
+    (s == "#" && t.spelling() == "%:") || (s == "##" && t.spelling() == "%:%:"));
 }
 size_t skip_space(const vector<Token> & ts, size_t at)
 {
@@ -329,6 +378,7 @@ public:
 private:
   string date_, time_;
   unordered_map<string, Macro> macros_;
+  IdentifierTable identifiers_;
   unordered_set<PreprocessorFileId, FileIdHash> once_;
   unsigned long long counter_;
   IPPTokenStream * post_;
@@ -369,7 +419,7 @@ private:
     {
       const Token & x = a.replacement[i], &y = b.replacement[i];
       if (x.kind != y.kind) return false;
-      string xs = x.text, ys = y.text;
+      string xs = x.spelling(), ys = y.spelling();
       if (x.kind == TK_IDENTIFIER && amap.count(xs)) xs = "$" + to_string(amap[xs]);
       if (y.kind == TK_IDENTIFIER && bmap.count(ys)) ys = "$" + to_string(bmap[ys]);
       if (xs != ys) return false;
@@ -396,24 +446,24 @@ private:
   static string canonical_parameter(const Token & t,
                                     const unordered_map<string, size_t> & params)
   {
-    if (t.kind == TK_IDENTIFIER && params.count(t.text))
-      return "$" + to_string(params.find(t.text)->second);
-    return t.text;
+    if (t.kind == TK_IDENTIFIER && params.count(t.spelling()))
+      return "$" + to_string(params.find(t.spelling())->second);
+    return t.spelling();
   }
 
   void define_macro(const vector<Token> & line, size_t at)
   {
     if (at >= line.size() || !is_identifier(line[at])) throw runtime_error("invalid #define");
-    const string name = line[at].text;
+    const string name = line[at].spelling();
     if (name == "__VA_ARGS__") throw runtime_error("invalid macro name");
     ++at;
     Macro m;
-    if (at < line.size() && line[at].kind == TK_PUNCT && line[at].text == "(")
+    if (at < line.size() && line[at].kind == TK_PUNCT && line[at].spelling() == "(")
     {
       m.function_like = true;
       ++at;
       at = skip_space(line, at);
-      if (at < line.size() && line[at].kind == TK_PUNCT && line[at].text == ")")
+      if (at < line.size() && line[at].kind == TK_PUNCT && line[at].spelling() == ")")
         ++at;
       else
       {
@@ -426,20 +476,20 @@ private:
           {
             if (!need_param) throw runtime_error("invalid variadic macro parameter list");
             m.variadic = true; ++at; at = skip_space(line, at);
-            if (at >= line.size() || line[at].kind != TK_PUNCT || line[at].text != ")")
+            if (at >= line.size() || line[at].kind != TK_PUNCT || line[at].spelling() != ")")
               throw runtime_error("variadic parameter must be last");
             ++at; break;
           }
-          if (!is_identifier(line[at]) || line[at].text == "__VA_ARGS__")
+          if (!is_identifier(line[at]) || line[at].spelling() == "__VA_ARGS__")
             throw runtime_error("invalid macro parameter");
-          const string param = line[at++].text;
+          const string param = line[at++].spelling();
           if (find(m.params.begin(), m.params.end(), param) != m.params.end())
             throw runtime_error("duplicate macro parameter");
           m.params.push_back(param); need_param = false;
           at = skip_space(line, at);
           if (at >= line.size()) throw runtime_error("unterminated macro parameter list");
-          if (line[at].kind == TK_PUNCT && line[at].text == ")") { ++at; break; }
-          if (line[at].kind == TK_PUNCT && line[at].text == ",") { ++at; need_param = true; continue; }
+          if (line[at].kind == TK_PUNCT && line[at].spelling() == ")") { ++at; break; }
+          if (line[at].kind == TK_PUNCT && line[at].spelling() == ",") { ++at; need_param = true; continue; }
           throw runtime_error("invalid macro parameter list");
         }
       }
@@ -449,30 +499,30 @@ private:
     m.replacement = normalize_replacement(raw);
     for (size_t i = 0; i < m.replacement.size(); ++i)
     {
-      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].text == "##") m.replacement[i].paste_operator = true;
-      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].text == "#") m.replacement[i].stringize_operator = true;
+      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "##") m.replacement[i].paste_operator = true;
+      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "#") m.replacement[i].stringize_operator = true;
     }
     unordered_map<string, size_t> param_map;
     for (size_t i = 0; i < m.params.size(); ++i) param_map[m.params[i]] = i;
     for (size_t i = 0; i < m.replacement.size(); ++i)
     {
-      if (m.replacement[i].kind == TK_IDENTIFIER && m.replacement[i].text == "__VA_ARGS__" && !m.variadic)
+      if (m.replacement[i].kind == TK_IDENTIFIER && m.replacement[i].spelling() == "__VA_ARGS__" && !m.variadic)
         throw runtime_error("__VA_ARGS__ used outside variadic macro");
-      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].text == "#")
+      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "#")
       {
         size_t before = i; while (before && is_space(m.replacement[before - 1])) --before;
         size_t after = i + 1; while (after < m.replacement.size() && is_space(m.replacement[after])) ++after;
-        const bool paste_operand = (before && m.replacement[before - 1].kind == TK_PUNCT && m.replacement[before - 1].text == "##") ||
-          (after < m.replacement.size() && m.replacement[after].kind == TK_PUNCT && m.replacement[after].text == "##");
+        const bool paste_operand = (before && m.replacement[before - 1].kind == TK_PUNCT && m.replacement[before - 1].spelling() == "##") ||
+          (after < m.replacement.size() && m.replacement[after].kind == TK_PUNCT && m.replacement[after].spelling() == "##");
         if (!paste_operand)
         {
           if (!m.function_like || after >= m.replacement.size() ||
-              !(is_identifier(m.replacement[after]) && (param_map.count(m.replacement[after].text) ||
-                (m.variadic && m.replacement[after].text == "__VA_ARGS__"))))
+              !(is_identifier(m.replacement[after]) && (param_map.count(m.replacement[after].spelling()) ||
+                (m.variadic && m.replacement[after].spelling() == "__VA_ARGS__"))))
             throw runtime_error("invalid stringizing operator");
         }
       }
-      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].text == "##")
+      if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "##")
       {
         size_t left = i;
         while (left && is_space(m.replacement[left - 1])) --left;
@@ -501,8 +551,8 @@ private:
     for (size_t i = open_index + 1; i < work.size(); ++i)
     {
       const Token & t = work[i];
-      if (t.kind == TK_PUNCT && t.text == "(") { ++depth; current.push_back(t); saw_any = true; }
-      else if (t.kind == TK_PUNCT && t.text == ")")
+      if (t.kind == TK_PUNCT && t.spelling() == "(") { ++depth; current.push_back(t); saw_any = true; }
+      else if (t.kind == TK_PUNCT && t.spelling() == ")")
       {
         if (depth == 0)
         {
@@ -512,7 +562,7 @@ private:
         }
         --depth; current.push_back(t); saw_any = true;
       }
-      else if (t.kind == TK_PUNCT && t.text == "," && depth == 0)
+      else if (t.kind == TK_PUNCT && t.spelling() == "," && depth == 0)
       {
         args->push_back(current); current.clear(); saw_any = true;
       }
@@ -524,7 +574,7 @@ private:
   Token pasted_token(const Token & left, const Token & right, const Token & head,
                      const string & macro_name)
   {
-    const string combined = left.text + right.text;
+    const string combined = left.spelling() + right.spelling();
     vector<Token> lexed = tokenize(combined);
     vector<Token> significant;
     for (size_t i = 0; i < lexed.size(); ++i)
@@ -533,6 +583,13 @@ private:
         significant[0].kind == TK_HEADER)
       throw runtime_error(string("invalid token paste in ") + macro_name + " [" + combined + "]");
     Token result = significant[0];
+    if (result.kind == TK_IDENTIFIER)
+    {
+      const string pasted_spelling = result.spelling();
+      result.identifier_id = identifiers_.intern(pasted_spelling);
+      result.identifier_table = &identifiers_;
+      result.text_storage.clear();
+    }
     result.file = head.file; result.line = head.line; result.presumed_line = head.presumed_line;
     result.unavailable = unite_paints(left.unavailable, right.unavailable);
     result.inherited_paint = head.unavailable;
@@ -556,7 +613,7 @@ private:
       if (pasted.empty() || r >= substituted.size()) throw runtime_error("invalid token paste");
       Token left = pasted.back(); pasted.pop_back();
       Token right = substituted[r]; q = r;
-      if (macro.variadic && left.kind == TK_PUNCT && left.text == ",")
+      if (macro.variadic && left.kind == TK_PUNCT && left.spelling() == ",")
       {
         // GNU's comma elision extension: an empty variadic tail removes the
         // comma, while a nonempty tail retains the comma and all tail tokens.
@@ -591,7 +648,7 @@ private:
         while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
         return BUILTIN_DEFERRED;
       }
-      if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].text != "(")
+      if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].spelling() != "(")
         return BUILTIN_NOT_INVOKED;
       vector<vector<Token> > builtin_args; size_t consumed = 0;
       if (!parse_arguments(work, open, &builtin_args, &consumed))
@@ -606,8 +663,8 @@ private:
       {
         size_t ai = skip_space(builtin_args[0], 0);
         if (ai < builtin_args[0].size() && is_identifier(builtin_args[0][ai]) &&
-            (builtin_args[0][ai].text == "no_unique_address" ||
-             builtin_args[0][ai].text == "__no_unique_address__"))
+            (builtin_args[0][ai].spelling() == "no_unique_address" ||
+             builtin_args[0][ai].spelling() == "__no_unique_address__"))
           known_attribute = true;
       }
     }
@@ -617,9 +674,9 @@ private:
     else if (macro.builtin == Macro::FILE)
       replacement = Token(TK_STRING, quote_string(head.file ? *head.file : string()), head.line, head.column);
     else if (macro.builtin == Macro::DATE)
-      replacement = Token(TK_STRING, macro.replacement.empty() ? date_ : macro.replacement[0].text, head.line, head.column);
+      replacement = Token(TK_STRING, macro.replacement.empty() ? date_ : macro.replacement[0].spelling(), head.line, head.column);
     else if (macro.builtin == Macro::TIME)
-      replacement = Token(TK_STRING, macro.replacement.empty() ? time_ : macro.replacement[0].text, head.line, head.column);
+      replacement = Token(TK_STRING, macro.replacement.empty() ? time_ : macro.replacement[0].spelling(), head.line, head.column);
     else if (macro.builtin == Macro::COUNTER)
       replacement = Token(TK_NUMBER, to_string(counter_++), head.line, head.column);
     else
@@ -639,9 +696,9 @@ private:
     bool possible_macro = false, found_pragma_operator = false;
     for (size_t i = 0; i < input.size(); ++i)
     {
-      if (is_identifier(input[i]) && input[i].text == "_Pragma") found_pragma_operator = true;
-      if (is_identifier(input[i]) && !contains_name(input[i].unavailable, input[i].text) &&
-          macros_.find(input[i].text) != macros_.end()) possible_macro = true;
+      if (is_identifier(input[i]) && input[i].spelling() == "_Pragma") found_pragma_operator = true;
+      if (is_identifier(input[i]) && !contains_name(input[i].unavailable, input[i].spelling()) &&
+          macros_.find(input[i].spelling()) != macros_.end()) possible_macro = true;
     }
     if (!possible_macro && (final || !found_pragma_operator))
     {
@@ -657,17 +714,17 @@ private:
     {
       if (++expansions > 10000000) throw runtime_error("macro expansion work limit");
       Token head = std::move(work.front()); work.pop_front();
-      if (!is_identifier(head) || contains_name(head.unavailable, head.text))
+      if (!is_identifier(head) || contains_name(head.unavailable, head.spelling()))
       { output.push_back(std::move(head)); continue; }
-      if (!final && head.text == "_Pragma")
+      if (!final && head.spelling() == "_Pragma")
       {
         if (deferred) deferred->push_back(std::move(head));
         while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
         break;
       }
-      unordered_map<string, Macro>::const_iterator found = macros_.find(head.text);
+      unordered_map<string, Macro>::const_iterator found = macros_.find(head.spelling());
       if (found == macros_.end()) { output.push_back(std::move(head)); continue; }
-      const string name = head.text;
+      const string name = head.spelling();
       const Macro & macro = found->second;
 
       if (macro.builtin != Macro::NONE)
@@ -692,7 +749,7 @@ private:
           while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
           break;
         }
-        if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].text != "(")
+        if (open >= work.size() || work[open].kind != TK_PUNCT || work[open].spelling() != "(")
         { output.push_back(std::move(head)); continue; }
         if (!parse_arguments(work, open, &args, &consumed))
         {
@@ -727,14 +784,14 @@ private:
           size_t hash_before = ri; while (hash_before && is_space(macro.replacement[hash_before - 1])) --hash_before;
           const bool stringize_candidate = rt.stringize_operator &&
             hash_after < macro.replacement.size() && is_identifier(macro.replacement[hash_after]) &&
-            param_index.count(macro.replacement[hash_after].text);
-          const bool hash_is_paste = rt.kind == TK_PUNCT && rt.text == "#" && !stringize_candidate &&
-            ((hash_after < macro.replacement.size() && macro.replacement[hash_after].kind == TK_PUNCT && macro.replacement[hash_after].text == "##") ||
-             (hash_before && macro.replacement[hash_before - 1].kind == TK_PUNCT && macro.replacement[hash_before - 1].text == "##"));
+            param_index.count(macro.replacement[hash_after].spelling());
+          const bool hash_is_paste = rt.kind == TK_PUNCT && rt.spelling() == "#" && !stringize_candidate &&
+            ((hash_after < macro.replacement.size() && macro.replacement[hash_after].kind == TK_PUNCT && macro.replacement[hash_after].spelling() == "##") ||
+             (hash_before && macro.replacement[hash_before - 1].kind == TK_PUNCT && macro.replacement[hash_before - 1].spelling() == "##"));
           if (stringize_candidate && !hash_is_paste)
           {
             size_t pi = skip_space(macro.replacement, ri + 1);
-            const string pname = macro.replacement[pi].text;
+            const string pname = macro.replacement[pi].spelling();
             size_t ix = param_index.at(pname);
             vector<Token> raw;
             if (ix < fixed) raw = args[ix];
@@ -752,13 +809,13 @@ private:
               if (is_space(raw[q])) { if (have) pending_space = true; continue; }
               if (pending_space) content.push_back(' ');
               pending_space = false; have = true;
-              for (size_t z = 0; z < raw[q].text.size(); ++z)
+              for (size_t z = 0; z < raw[q].spelling().size(); ++z)
               {
                 const bool literal_token = raw[q].kind == TK_STRING || raw[q].kind == TK_UD_STRING ||
                   raw[q].kind == TK_CHARACTER || raw[q].kind == TK_UD_CHARACTER;
-                if (literal_token && (raw[q].text[z] == '\\' || raw[q].text[z] == '"'))
+                if (literal_token && (raw[q].spelling()[z] == '\\' || raw[q].spelling()[z] == '"'))
                   content.push_back('\\');
-                content.push_back(raw[q].text[z]);
+                content.push_back(raw[q].spelling()[z]);
               }
             }
             Token stringized(TK_STRING, string("\"") + content + "\"", head.line, head.column);
@@ -768,13 +825,13 @@ private:
             substituted.push_back(stringized); ri = pi;
             continue;
           }
-          if (is_identifier(rt) && param_index.count(rt.text))
+          if (is_identifier(rt) && param_index.count(rt.spelling()))
           {
-            const size_t ix = param_index[rt.text];
+            const size_t ix = param_index[rt.spelling()];
             size_t prev = ri; while (prev && is_space(macro.replacement[prev - 1])) --prev;
             size_t next = ri + 1; while (next < macro.replacement.size() && is_space(macro.replacement[next])) ++next;
-            const bool pasted = (prev && macro.replacement[prev - 1].kind == TK_PUNCT && macro.replacement[prev - 1].text == "##") ||
-              (next < macro.replacement.size() && macro.replacement[next].kind == TK_PUNCT && macro.replacement[next].text == "##");
+            const bool pasted = (prev && macro.replacement[prev - 1].kind == TK_PUNCT && macro.replacement[prev - 1].spelling() == "##") ||
+              (next < macro.replacement.size() && macro.replacement[next].kind == TK_PUNCT && macro.replacement[next].spelling() == "##");
             vector<Token> values;
             if (ix < fixed) values = args[ix];
             else
@@ -794,7 +851,7 @@ private:
             for (size_t q = 0; q < values.size(); ++q)
             {
               Token value = values[q];
-              if (is_identifier(value) && macros_.find(value.text) != macros_.end())
+              if (is_identifier(value) && macros_.find(value.spelling()) != macros_.end())
               {
                 if (value.from_macro)
                 {
@@ -852,7 +909,7 @@ private:
     {
       if (!found_pragma_operator)
         for (size_t i = 0; i < output.size(); ++i)
-          if (is_identifier(output[i]) && output[i].text == "_Pragma") { found_pragma_operator = true; break; }
+          if (is_identifier(output[i]) && output[i].spelling() == "_Pragma") { found_pragma_operator = true; break; }
       *contains_pragma_operator = found_pragma_operator;
     }
     return output;
@@ -864,20 +921,20 @@ private:
     vector<Token> protected_tokens;
     for (size_t i = 0; i < expression.size(); ++i)
     {
-      if (is_identifier(expression[i]) && expression[i].text == "defined")
+      if (is_identifier(expression[i]) && expression[i].spelling() == "defined")
       {
         size_t j = skip_space(expression, i + 1); bool paren = false;
-        if (j < expression.size() && expression[j].kind == TK_PUNCT && expression[j].text == "(")
+        if (j < expression.size() && expression[j].kind == TK_PUNCT && expression[j].spelling() == "(")
         { paren = true; j = skip_space(expression, j + 1); }
         if (j >= expression.size() || !(is_identifier(expression[j]) ||
-            (expression[j].kind == TK_PUNCT && is_alternative_word(expression[j].text))))
+            (expression[j].kind == TK_PUNCT && is_alternative_word(expression[j].spelling()))))
           throw runtime_error("invalid defined operator");
-        const string operand = expression[j].text;
+        const string operand = expression[j].spelling();
         const bool exists = macros_.find(operand) != macros_.end();
         ++j; j = skip_space(expression, j);
         if (paren)
         {
-          if (j >= expression.size() || expression[j].kind != TK_PUNCT || expression[j].text != ")")
+          if (j >= expression.size() || expression[j].kind != TK_PUNCT || expression[j].spelling() != ")")
             throw runtime_error("invalid defined operator");
           ++j;
         }
@@ -895,17 +952,17 @@ private:
       if (is_space(t)) continue;
       if (t.kind == TK_IDENTIFIER)
       {
-        if (t.text == "true" || t.text == "false")
-          operands.push_back(ControlExpressionToken(ControlExpressionToken::IDENTIFIER, t.text));
+        if (t.spelling() == "true" || t.spelling() == "false")
+          operands.push_back(ControlExpressionToken(ControlExpressionToken::IDENTIFIER, t.spelling()));
         else operands.push_back(ControlExpressionToken(ControlExpressionToken::PP_NUMBER, "0"));
       }
       else if (t.kind == TK_NUMBER)
-        operands.push_back(ControlExpressionToken(ControlExpressionToken::PP_NUMBER, t.text));
+        operands.push_back(ControlExpressionToken(ControlExpressionToken::PP_NUMBER, t.spelling()));
       else if (t.kind == TK_CHARACTER)
-        operands.push_back(ControlExpressionToken(ControlExpressionToken::CHARACTER_LITERAL, t.text));
+        operands.push_back(ControlExpressionToken(ControlExpressionToken::CHARACTER_LITERAL, t.spelling()));
       else if (t.kind == TK_PUNCT)
-        operands.push_back(ControlExpressionToken(ControlExpressionToken::OPERATOR, t.text));
-      else operands.push_back(ControlExpressionToken(ControlExpressionToken::INVALID, t.text));
+        operands.push_back(ControlExpressionToken(ControlExpressionToken::OPERATOR, t.spelling()));
+      else operands.push_back(ControlExpressionToken(ControlExpressionToken::INVALID, t.spelling()));
     }
     bool result = false;
     if (!evaluate_control_expression_tokens(operands, &result))
@@ -930,23 +987,23 @@ private:
   {
     bool has_pragma_operator = false;
     for (size_t i = 0; i < tokens->size(); ++i)
-      if (is_identifier((*tokens)[i]) && (*tokens)[i].text == "_Pragma") { has_pragma_operator = true; break; }
+      if (is_identifier((*tokens)[i]) && (*tokens)[i].spelling() == "_Pragma") { has_pragma_operator = true; break; }
     if (!has_pragma_operator) return;
     vector<Token> out;
     for (size_t i = 0; i < tokens->size(); ++i)
     {
       const Token & t = (*tokens)[i];
-      if (!is_identifier(t) || t.text != "_Pragma") { out.push_back(t); continue; }
+      if (!is_identifier(t) || t.spelling() != "_Pragma") { out.push_back(t); continue; }
       size_t j = skip_space(*tokens, i + 1);
-      if (j >= tokens->size() || (*tokens)[j].kind != TK_PUNCT || (*tokens)[j].text != "(")
+      if (j >= tokens->size() || (*tokens)[j].kind != TK_PUNCT || (*tokens)[j].spelling() != "(")
         throw runtime_error("invalid _Pragma operator");
       j = skip_space(*tokens, j + 1);
       if (j >= tokens->size() || ((*tokens)[j].kind != TK_STRING && (*tokens)[j].kind != TK_UD_STRING))
         throw runtime_error("invalid _Pragma operand");
       string pragma;
-      if (!decode_string_literal((*tokens)[j].text, &pragma)) throw runtime_error("invalid _Pragma string");
+      if (!decode_string_literal((*tokens)[j].spelling(), &pragma)) throw runtime_error("invalid _Pragma string");
       size_t end = skip_space(*tokens, j + 1);
-      if (end >= tokens->size() || (*tokens)[end].kind != TK_PUNCT || (*tokens)[end].text != ")")
+      if (end >= tokens->size() || (*tokens)[end].kind != TK_PUNCT || (*tokens)[end].spelling() != ")")
         throw runtime_error("invalid _Pragma invocation");
       if (pragma == "once") mark_pragma_once(t.file ? *t.file : fallback_file);
       i = end;
@@ -970,17 +1027,17 @@ private:
       switch (t.kind)
       {
         case TK_SPACE: case TK_NEWLINE: post_->emit_whitespace_sequence(); break;
-        case TK_HEADER: post_->emit_header_name(t.text); break;
+        case TK_HEADER: post_->emit_header_name(t.spelling()); break;
         case TK_IDENTIFIER:
-          if (t.text == "__VA_ARGS__") throw runtime_error("__VA_ARGS__ outside variadic macro");
-          post_->emit_identifier(t.text); break;
-        case TK_NUMBER: post_->emit_pp_number(t.text); break;
-        case TK_CHARACTER: post_->emit_character_literal(t.text); break;
-        case TK_UD_CHARACTER: post_->emit_user_defined_character_literal(t.text); break;
-        case TK_STRING: post_->emit_string_literal(t.text); break;
-        case TK_UD_STRING: post_->emit_user_defined_string_literal(t.text); break;
-        case TK_PUNCT: post_->emit_preprocessing_op_or_punc(t.text); break;
-        case TK_OTHER: post_->emit_non_whitespace_char(t.text); break;
+          if (t.spelling() == "__VA_ARGS__") throw runtime_error("__VA_ARGS__ outside variadic macro");
+          post_->emit_identifier(t.spelling()); break;
+        case TK_NUMBER: post_->emit_pp_number(t.spelling()); break;
+        case TK_CHARACTER: post_->emit_character_literal(t.spelling()); break;
+        case TK_UD_CHARACTER: post_->emit_user_defined_character_literal(t.spelling()); break;
+        case TK_STRING: post_->emit_string_literal(t.spelling()); break;
+        case TK_UD_STRING: post_->emit_user_defined_string_literal(t.spelling()); break;
+        case TK_PUNCT: post_->emit_preprocessing_op_or_punc(t.spelling()); break;
+        case TK_OTHER: post_->emit_non_whitespace_char(t.spelling()); break;
         case TK_PLACEMARK: break;
       }
     }
@@ -995,13 +1052,13 @@ private:
     string next;
     if (end == start + 1 && expanded[start].kind == TK_HEADER)
     {
-      const string & h = expanded[start].text;
+      const string & h = expanded[start].spelling();
       if (h.size() < 2 || (h[0] != '<' && h[0] != '"')) throw runtime_error("invalid header name");
       next = h.substr(1, h.size() - 2);
     }
     else if (end == start + 1 && expanded[start].kind == TK_STRING)
     {
-      if (!decode_string_literal(expanded[start].text, &next)) throw runtime_error("invalid include string");
+      if (!decode_string_literal(expanded[start].spelling(), &next)) throw runtime_error("invalid include string");
     }
     else throw runtime_error("invalid include operand");
     string pathrel;
@@ -1076,7 +1133,16 @@ private:
     }
   private:
     void add(TokenKind kind, const string & spelling)
-    { current.push_back(Token(kind, spelling, line, column)); }
+    {
+      Token token(kind, string(), line, column);
+      if (kind == TK_IDENTIFIER)
+      {
+        token.identifier_table = &owner.identifiers_;
+        token.identifier_id = owner.identifiers_.intern(spelling);
+      }
+      else token.text_storage = spelling;
+      current.push_back(std::move(token));
+    }
   };
 
 
@@ -1124,7 +1190,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         throw runtime_error("non-directive in active region");
       return;
     }
-    const string directive = line[name_at].text;
+    const string directive = line[name_at].spelling();
     const size_t args_at = name_at + 1;
     vector<Token> args(line.begin() + args_at, line.end());
     const bool enabled = file.conditions.empty() || file.conditions.back().active;
@@ -1138,7 +1204,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         {
           size_t a = skip_space(args, 0);
           if (a >= args.size() || !is_identifier(args[a])) throw runtime_error("invalid conditional identifier");
-          const bool defined = macros_.find(args[a].text) != macros_.end();
+          const bool defined = macros_.find(args[a].spelling()) != macros_.end();
           size_t tail = skip_space(args, a + 1);
           if (tail != args.size()) throw runtime_error("extra conditional tokens");
           value = directive == "ifdef" ? defined : !defined;
@@ -1182,9 +1248,9 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
     else if (directive == "undef")
     {
       size_t a = skip_space(args, 0);
-      if (a >= args.size() || !is_identifier(args[a]) || args[a].text == "__VA_ARGS__" ||
+      if (a >= args.size() || !is_identifier(args[a]) || args[a].spelling() == "__VA_ARGS__" ||
           skip_space(args, a + 1) != args.size()) throw runtime_error("invalid #undef");
-      macros_.erase(args[a].text);
+      macros_.erase(args[a].spelling());
     }
     else if (directive == "include")
     {
@@ -1199,7 +1265,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
       size_t a = skip_space(expanded, 0);
       if (a >= expanded.size() || expanded[a].kind != TK_NUMBER) throw runtime_error("invalid #line number");
       char * tail = 0;
-      unsigned long long value = strtoull(expanded[a].text.c_str(), &tail, 10);
+      unsigned long long value = strtoull(expanded[a].spelling().c_str(), &tail, 10);
       if (!tail || *tail || value == 0 || value > static_cast<unsigned long long>(numeric_limits<long long>::max()))
         throw runtime_error("invalid #line number");
       size_t b = skip_space(expanded, a + 1);
@@ -1208,7 +1274,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
       {
         if (expanded[b].kind != TK_STRING || after != expanded.size()) throw runtime_error("invalid #line filename");
         string filename;
-        if (!decode_string_literal(expanded[b].text, &filename)) throw runtime_error("invalid #line filename");
+        if (!decode_string_literal(expanded[b].spelling(), &filename)) throw runtime_error("invalid #line filename");
         file.presumed_file = filename;
         file.presumed_file_ref.reset(new string(filename));
       }
@@ -1220,7 +1286,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
     else if (directive == "pragma")
     {
       const size_t a = skip_space(args, 0);
-      if (a < args.size() && is_identifier(args[a]) && args[a].text == "once")
+      if (a < args.size() && is_identifier(args[a]) && args[a].spelling() == "once")
         mark_pragma_once(file.presumed_file);
       // Unknown pragmas are deliberately ignored.
     }
