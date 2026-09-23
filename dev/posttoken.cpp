@@ -560,61 +560,61 @@ struct DebugPostTokenOutputStream
 	// output: invalid <source>
 	void emit_invalid(const string& source)
 	{
-		cout << "invalid " << source << endl;
+		cout << "invalid " << source << '\n';
 	}
 
 	// output: simple <source> <token_type>
 	void emit_simple(const string& source, ETokenType token_type)
 	{
-		cout << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << endl;
+		cout << "simple " << source << " " << TokenTypeToStringMap.at(token_type) << '\n';
 	}
 
 	// output: identifier <source>
 	void emit_identifier(const string& source)
 	{
-		cout << "identifier " << source << endl;
+		cout << "identifier " << source << '\n';
 	}
 
 	// output: literal <source> <type> <hexdump(data,nbytes)>
 	void emit_literal(const string& source, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "literal " << source << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << endl;
+		cout << "literal " << source << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: literal <source> array of <num_elements> <type> <hexdump(data,nbytes)>
 	void emit_literal_array(const string& source, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "literal " << source << " array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << endl;
+		cout << "literal " << source << " array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> character <type> <hexdump(data,nbytes)>
 	void emit_user_defined_literal_character(const string& source, const string& ud_suffix, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " character " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << endl;
+		cout << "user-defined-literal " << source << " " << ud_suffix << " character " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> string array of <num_elements> <type> <hexdump(data, nbytes)>
 	void emit_user_defined_literal_string_array(const string& source, const string& ud_suffix, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " string array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << endl;
+		cout << "user-defined-literal " << source << " " << ud_suffix << " string array of " << num_elements << " " << FundamentalTypeToStringMap.at(type) << " " << HexDump(data, nbytes) << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
 	void emit_user_defined_literal_integer(const string& source, const string& ud_suffix, const string& prefix)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " integer " << prefix << endl;
+		cout << "user-defined-literal " << source << " " << ud_suffix << " integer " << prefix << '\n';
 	}
 
 	// output: user-defined-literal <source> <ud_suffix> <prefix>
 	void emit_user_defined_literal_floating(const string& source, const string& ud_suffix, const string& prefix)
 	{
-		cout << "user-defined-literal " << source << " " << ud_suffix << " floating " << prefix << endl;
+		cout << "user-defined-literal " << source << " " << ud_suffix << " floating " << prefix << '\n';
 	}
 
 	// output : eof
 	void emit_eof()
 	{
-		cout << "eof" << endl;
+		cout << "eof" << '\n';
 	}
 };
 
@@ -739,7 +739,9 @@ void append_utf8(uint32_t cp, string * out)
 
 bool valid_ud_suffix(const string & suffix)
 {
-  if (suffix.size() < 2 || suffix[0] != '_') return false;
+  // A lone underscore is itself an identifier (N3485 [lex.name]); it is a
+  // valid lexical ud-suffix even though later semantic lookup may fail.
+  if (suffix.empty() || suffix[0] != '_') return false;
   size_t at = 1;
   while (at < suffix.size())
   {
@@ -982,25 +984,23 @@ void emit_integer_literal(DebugPostTokenOutputStream & output,
 
 bool try_ud_number(const string & s, DebugPostTokenOutputStream & output)
 {
-  for (size_t split = 1; split < s.size(); ++split)
+  const size_t split = s.find('_');
+  if (split == string::npos) return false;
+  const string suffix = s.substr(split);
+  if (!valid_ud_suffix(suffix)) return false;
+  const string prefix = s.substr(0, split);
+  size_t end = 0;
+  unsigned base = 10;
+  if (parse_integer_core_syntax(prefix, &end, &base) && end == prefix.size())
   {
-    if (s[split] != '_') continue;
-    const string suffix = s.substr(split);
-    if (!valid_ud_suffix(suffix)) continue;
-    const string prefix = s.substr(0, split);
-    size_t end = 0;
-    unsigned base = 10;
-    if (parse_integer_core_syntax(prefix, &end, &base) && end == prefix.size())
-    {
-      output.emit_user_defined_literal_integer(s, suffix, prefix);
-      return true;
-    }
-    bool is_float = false;
-    if (parse_decimal_float_core(prefix, &end, &is_float) && end == prefix.size())
-    {
-      output.emit_user_defined_literal_floating(s, suffix, prefix);
-      return true;
-    }
+    output.emit_user_defined_literal_integer(s, suffix, prefix);
+    return true;
+  }
+  bool is_float = false;
+  if (parse_decimal_float_core(prefix, &end, &is_float) && end == prefix.size())
+  {
+    output.emit_user_defined_literal_floating(s, suffix, prefix);
+    return true;
   }
   return false;
 }
@@ -1505,7 +1505,7 @@ int main(int argc, char** argv)
   }
   catch (const exception & e)
   {
-    cerr << "ERROR: " << e.what() << endl;
+    cerr << "ERROR: " << e.what() << '\n';
     return EXIT_FAILURE;
   }
 }

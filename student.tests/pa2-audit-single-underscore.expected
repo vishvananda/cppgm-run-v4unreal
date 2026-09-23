@@ -1,0 +1,4 @@
+user-defined-literal 1_ _ integer 1
+user-defined-literal 'a'_ _ character char 61
+user-defined-literal "a"_ _ string array of 2 char 6100
+eof

@@ -1,0 +1,5 @@
+user-defined-literal u"𝄞" "A\x42"_ud _ud string array of 5 char16_t 34D81EDD410042000000
+simple ; OP_SEMICOLON
+literal 0xffffffffffffffffULL unsigned long long int FFFFFFFFFFFFFFFF
+literal 'π' int C0030000
+eof
