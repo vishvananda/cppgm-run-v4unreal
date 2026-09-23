@@ -423,9 +423,8 @@ private:
   size_t at_;
   unsigned recursion_depth_;
 
-  bool consume(const char * spelling)
+  bool consume(OperatorKind op)
   {
-    const OperatorKind op = operator_kind(spelling);
     if (at_ < tokens_.size() && tokens_[at_].kind == TOKEN_OPERATOR &&
         tokens_[at_].op == op)
     {
@@ -441,9 +440,8 @@ private:
     return tokens_[at_++];
   }
 
-  bool at_operator(const char * spelling) const
+  bool at_operator(OperatorKind op) const
   {
-    const OperatorKind op = operator_kind(spelling);
     return at_ < tokens_.size() && tokens_[at_].kind == TOKEN_OPERATOR &&
            tokens_[at_].op == op;
   }
@@ -461,14 +459,14 @@ private:
 
   Value parse_primary(bool evaluate)
   {
-    if (consume("("))
+    if (consume(OP_LPAREN))
     {
       enter_recursion();
       Value nested;
       try
       {
         nested = parse_conditional(evaluate);
-        if (!consume(")")) throw ExpressionFailure();
+        if (!consume(OP_RPAREN)) throw ExpressionFailure();
       }
       catch (...)
       {
@@ -487,11 +485,11 @@ private:
       if (token.identifier == IDENTIFIER_FALSE) return Value(0, false);
       if (token.identifier != IDENTIFIER_DEFINED) return Value(0, false);
 
-      const bool parenthesized = consume("(");
+      const bool parenthesized = consume(OP_LPAREN);
       if (at_ >= tokens_.size() || !tokens_[at_].identifier_operand)
         throw ExpressionFailure();
       const bool first_byte_odd = tokens_[at_++].first_byte_odd;
-      if (parenthesized && !consume(")")) throw ExpressionFailure();
+      if (parenthesized && !consume(OP_RPAREN)) throw ExpressionFailure();
       return Value(first_byte_odd ? 1 : 0, false);
     }
     throw ExpressionFailure();
@@ -500,10 +498,10 @@ private:
   Value parse_unary(bool evaluate)
   {
     OperatorKind op = OP_UNSUPPORTED;
-    if (at_operator("+")) op = OP_PLUS;
-    else if (at_operator("-")) op = OP_MINUS;
-    else if (at_operator("!")) op = OP_LNOT;
-    else if (at_operator("~")) op = OP_COMPL;
+    if (at_operator(OP_PLUS)) op = OP_PLUS;
+    else if (at_operator(OP_MINUS)) op = OP_MINUS;
+    else if (at_operator(OP_LNOT)) op = OP_LNOT;
+    else if (at_operator(OP_COMPL)) op = OP_COMPL;
     if (op == OP_UNSUPPORTED) return parse_primary(evaluate);
 
     ++at_;
@@ -607,7 +605,7 @@ private:
   Value parse_multiplicative(bool evaluate)
   {
     Value value = parse_unary(evaluate);
-    while (at_operator("*") || at_operator("/") || at_operator("%"))
+    while (at_operator(OP_STAR) || at_operator(OP_DIV) || at_operator(OP_MOD))
     {
       const OperatorKind op = take().op;
       const Value rhs = parse_unary(evaluate);
@@ -619,7 +617,7 @@ private:
   Value parse_additive(bool evaluate)
   {
     Value value = parse_multiplicative(evaluate);
-    while (at_operator("+") || at_operator("-"))
+    while (at_operator(OP_PLUS) || at_operator(OP_MINUS))
     {
       const OperatorKind op = take().op;
       const Value rhs = parse_multiplicative(evaluate);
@@ -631,7 +629,7 @@ private:
   Value parse_shift(bool evaluate)
   {
     Value value = parse_additive(evaluate);
-    while (at_operator("<<") || at_operator(">>"))
+    while (at_operator(OP_LSHIFT) || at_operator(OP_RSHIFT))
     {
       const OperatorKind op = take().op;
       const Value rhs = parse_additive(evaluate);
@@ -643,8 +641,8 @@ private:
   Value parse_relational(bool evaluate)
   {
     Value value = parse_shift(evaluate);
-    while (at_operator("<") || at_operator(">") || at_operator("<=") ||
-           at_operator(">="))
+    while (at_operator(OP_LT) || at_operator(OP_GT) || at_operator(OP_LE) ||
+           at_operator(OP_GE))
     {
       const OperatorKind op = take().op;
       const Value rhs = parse_shift(evaluate);
@@ -656,7 +654,7 @@ private:
   Value parse_equality(bool evaluate)
   {
     Value value = parse_relational(evaluate);
-    while (at_operator("==") || at_operator("!="))
+    while (at_operator(OP_EQ) || at_operator(OP_NE))
     {
       const OperatorKind op = take().op;
       const Value rhs = parse_relational(evaluate);
@@ -668,7 +666,7 @@ private:
   Value parse_and(bool evaluate)
   {
     Value value = parse_equality(evaluate);
-    while (consume("&"))
+    while (consume(OP_AMP))
     {
       const Value rhs = parse_equality(evaluate);
       value = apply(OP_AMP, value, rhs, evaluate);
@@ -679,7 +677,7 @@ private:
   Value parse_xor(bool evaluate)
   {
     Value value = parse_and(evaluate);
-    while (consume("^"))
+    while (consume(OP_XOR))
     {
       const Value rhs = parse_and(evaluate);
       value = apply(OP_XOR, value, rhs, evaluate);
@@ -690,7 +688,7 @@ private:
   Value parse_or(bool evaluate)
   {
     Value value = parse_xor(evaluate);
-    while (consume("|"))
+    while (consume(OP_BOR))
     {
       const Value rhs = parse_xor(evaluate);
       value = apply(OP_BOR, value, rhs, evaluate);
@@ -701,7 +699,7 @@ private:
   Value parse_logical_and(bool evaluate)
   {
     Value value = parse_or(evaluate);
-    while (consume("&&"))
+    while (consume(OP_LAND))
     {
       const bool evaluate_rhs = evaluate && truth(value);
       const Value rhs = parse_or(evaluate_rhs);
@@ -713,7 +711,7 @@ private:
   Value parse_logical_or(bool evaluate)
   {
     Value value = parse_logical_and(evaluate);
-    while (consume("||"))
+    while (consume(OP_LOR))
     {
       const bool evaluate_rhs = evaluate && !truth(value);
       const Value rhs = parse_logical_and(evaluate_rhs);
@@ -725,7 +723,7 @@ private:
   Value parse_conditional(bool evaluate)
   {
     Value condition = parse_logical_or(evaluate);
-    if (!consume("?")) return condition;
+    if (!consume(OP_QMARK)) return condition;
 
     const bool select_true = evaluate && truth(condition);
     enter_recursion();
@@ -733,7 +731,7 @@ private:
     try
     {
       when_true = parse_conditional(select_true);
-      if (!consume(":")) throw ExpressionFailure();
+      if (!consume(OP_COLON)) throw ExpressionFailure();
     }
     catch (...)
     {

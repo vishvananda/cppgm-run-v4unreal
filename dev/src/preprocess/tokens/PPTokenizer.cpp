@@ -1010,37 +1010,70 @@ private:
 
   bool scan_operator(std::string * op)
   {
-    if (peek(0).cp == '<' && peek(1).cp == ':' && peek(2).cp == ':' &&
+    const int first = peek(0).cp;
+    if (first == '<' && peek(1).cp == ':' && peek(2).cp == ':' &&
         peek(3).cp != ':' && peek(3).cp != '>')
     {
       take();
       op->assign("<");
       return true;
     }
-    static const char * const operators[] = {
-      "%:%:", "->*", "<<=", ">>=", "...", "##", "<:", ":>", "<%",
-      "%>", "%:", ".*", "::", "->", "+=", "-=", "*=", "/=", "%=",
-      "^=", "&=", "|=", "<<", ">>", "<=", ">=", "&&", "==", "!=",
-      "||", "++", "--", "{", "}", "[", "]", "#", "(", ")", ";",
-      ":", "?", ".", "+", "-", "*", "/", "%", "^", "&", "|", "~",
-      "!", "=", "<", ">", ","
-    };
-    for (std::size_t i = 0; i < sizeof(operators) / sizeof(operators[0]); ++i)
+
+    // Group candidates by their first character. The old linear scan built a
+    // temporary string and probed lookahead for every punctuation candidate,
+    // even when its first byte differed. Expressions rich in punctuation
+    // therefore did work proportional to tokens times the full operator list.
+    // Each group below is in maximal-munch order and has bounded size.
+    const char * const * candidates = 0;
+    std::size_t count = 0;
+#define OPERATOR_GROUP(ch, ...) \
+    case ch: { static const char * const group[] = { __VA_ARGS__ }; \
+      candidates = group; count = sizeof(group) / sizeof(group[0]); break; }
+    switch (first)
     {
-      const std::string candidate(operators[i]);
-      bool match = true;
-      for (std::size_t j = 0; j < candidate.size(); ++j)
-        if (peek(j).cp != static_cast<unsigned char>(candidate[j]))
-        {
-          match = false;
-          break;
-        }
-      if (!match)
-        continue;
-      for (std::size_t j = 0; j < candidate.size(); ++j)
-        take();
-      *op = candidate;
-      return true;
+    OPERATOR_GROUP('%', "%:%:", "%>", "%:", "%=", "%")
+    OPERATOR_GROUP('#', "##", "#")
+    OPERATOR_GROUP('-', "->*", "->", "--", "-=", "-")
+    OPERATOR_GROUP('<', "<<=", "<<", "<=", "<:", "<%", "<")
+    OPERATOR_GROUP('>', ">>=", ">>", ">=", ">")
+    OPERATOR_GROUP('.', "...", ".*", ".")
+    OPERATOR_GROUP('+', "++", "+=", "+")
+    OPERATOR_GROUP('*', "*=", "*")
+    OPERATOR_GROUP('/', "/=", "/")
+    OPERATOR_GROUP('^', "^=", "^")
+    OPERATOR_GROUP('&', "&&", "&=", "&")
+    OPERATOR_GROUP('|', "||", "|=", "|")
+    OPERATOR_GROUP('!', "!=", "!")
+    OPERATOR_GROUP('=', "==", "=")
+    OPERATOR_GROUP(':', "::", ":>", ":")
+    OPERATOR_GROUP('(', "(")
+    OPERATOR_GROUP(')', ")")
+    OPERATOR_GROUP(';', ";")
+    OPERATOR_GROUP('?', "?")
+    OPERATOR_GROUP('~', "~")
+    OPERATOR_GROUP('{', "{")
+    OPERATOR_GROUP('}', "}")
+    OPERATOR_GROUP('[', "[")
+    OPERATOR_GROUP(']', "]")
+    OPERATOR_GROUP(',', ",")
+    default: return false;
+    }
+#undef OPERATOR_GROUP
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+      const char * candidate = candidates[i];
+      std::size_t length = 0;
+      while (candidate[length] &&
+             peek(length).cp == static_cast<unsigned char>(candidate[length]))
+        ++length;
+      if (candidate[length] == '\0')
+      {
+        for (std::size_t j = 0; j < length; ++j)
+          take();
+        op->assign(candidate, length);
+        return true;
+      }
     }
     return false;
   }
