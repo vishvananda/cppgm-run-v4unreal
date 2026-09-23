@@ -7,11 +7,11 @@ FRONTEND_SOURCE_SET_TARGETS := abimangle pptoken posttoken ppexpr preproc cppgm+
 FRONTEND_TEST_RUNNER_SOURCE_ID := support/testing/test_runner
 
 FRONTEND_OBJ_BASENAMES_abimangle :=
-FRONTEND_OBJ_BASENAMES_pptoken :=
-FRONTEND_OBJ_BASENAMES_posttoken :=
-FRONTEND_OBJ_BASENAMES_ppexpr :=
-FRONTEND_OBJ_BASENAMES_preproc :=
-FRONTEND_OBJ_BASENAMES_cppgm++ :=
+FRONTEND_OBJ_BASENAMES_pptoken := preprocess/tokens/PPTokenizer
+FRONTEND_OBJ_BASENAMES_posttoken := preprocess/tokens/PPTokenizer
+FRONTEND_OBJ_BASENAMES_ppexpr := preprocess/tokens/PPTokenizer
+FRONTEND_OBJ_BASENAMES_preproc := preprocess/tokens/PPTokenizer
+FRONTEND_OBJ_BASENAMES_cppgm++ := preprocess/tokens/PPTokenizer
 FRONTEND_OBJ_BASENAMES_lowiropt :=
 FRONTEND_OBJ_BASENAMES_lowir :=
 FRONTEND_OBJ_BASENAMES_lowir2native :=

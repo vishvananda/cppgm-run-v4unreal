@@ -1,5 +1,9 @@
 whitespace-sequence 0 
 new-line 0 
+new-line 0 
+new-line 0 
+new-line 0 
+new-line 0 
 preprocessing-op-or-punc 1 #
 identifier 7 include
 whitespace-sequence 0 
@@ -463,6 +467,7 @@ whitespace-sequence 0
 identifier 13 days_in_month
 preprocessing-op-or-punc 1 ,
 whitespace-sequence 0 
+new-line 0 
 new-line 0 
 whitespace-sequence 0 
 identifier 3 day
