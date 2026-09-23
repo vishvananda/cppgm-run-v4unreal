@@ -1,0 +1,17 @@
+preproc 1
+sof student.tests/pa4-audit-flow.t
+simple int KW_INT
+identifier value0
+simple = OP_ASS
+simple ( OP_LPAREN
+simple ( OP_LPAREN
+literal 7 int 07000000
+simple ) OP_RPAREN
+simple * OP_STAR
+simple ( OP_LPAREN
+literal 7 int 07000000
+simple ) OP_RPAREN
+simple ) OP_RPAREN
+simple ; OP_SEMICOLON
+literal "value0" array of 7 char 76616C75653000
+eof

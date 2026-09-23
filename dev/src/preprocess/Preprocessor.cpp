@@ -10,7 +10,6 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
-#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -41,38 +40,172 @@ namespace {
 enum TokenKind { TK_SPACE, TK_NEWLINE, TK_HEADER, TK_IDENTIFIER, TK_NUMBER,
   TK_CHARACTER, TK_UD_CHARACTER, TK_STRING, TK_UD_STRING, TK_PUNCT,
   TK_OTHER, TK_PLACEMARK };
-struct PaintNode;
-typedef shared_ptr<const PaintNode> Paint;
+typedef uint32_t Paint;
 struct PaintNode
 {
-  string name;
+  uint32_t identifier;
   unsigned priority;
   Paint left, right;
   size_t size;
-  PaintNode(const string & n, unsigned p, const Paint & l, const Paint & r)
-    : name(n), priority(p), left(l), right(r), size(1 + (l ? l->size : 0) + (r ? r->size : 0)) {}
+  PaintNode(uint32_t id = 0, unsigned p = 0, Paint l = 0, Paint r = 0, size_t n = 0)
+    : identifier(id), priority(p), left(l), right(r), size(n) {}
+};
+
+// Translation-unit-local persistent treap nodes are stored in a geometrically
+// grown slab. Tokens carry compact root handles; no per-token shared ownership
+// or per-node allocation is needed. The slab is reset after a completed logical
+// line, unless an incomplete invocation keeps its painted tokens deferred.
+class PaintTable
+{
+public:
+  PaintTable() { reset(); }
+
+  void reset()
+  {
+    nodes_.clear();
+    nodes_.push_back(PaintNode()); // handle zero is the empty set
+  }
+
+  bool has(Paint root, uint32_t identifier) const
+  {
+    while (root)
+    {
+      const PaintNode & node = nodes_[root];
+      if (identifier == node.identifier) return true;
+      root = identifier < node.identifier ? node.left : node.right;
+    }
+    return false;
+  }
+
+  Paint insert(Paint root, uint32_t identifier)
+  {
+    if (has(root, identifier)) return root;
+    return insert_missing(root, identifier);
+  }
+
+  Paint intersect(Paint a, Paint b)
+  {
+    if (a == b) return a;
+    vector<uint32_t> identifiers;
+    collect((a && (!b || nodes_[a].size <= nodes_[b].size)) ? a : b, &identifiers);
+    const Paint other = (a && (!b || nodes_[a].size <= nodes_[b].size)) ? b : a;
+    Paint result = 0;
+    for (size_t i = 0; i < identifiers.size(); ++i)
+      if (has(other, identifiers[i])) result = insert(result, identifiers[i]);
+    return result;
+  }
+
+  Paint unite(Paint a, Paint b)
+  {
+    if (a == b) return a;
+    vector<uint32_t> identifiers; collect(b, &identifiers);
+    Paint result = a;
+    for (size_t i = 0; i < identifiers.size(); ++i)
+      result = insert(result, identifiers[i]);
+    return result;
+  }
+
+  Paint difference(Paint a, Paint b)
+  {
+    if (!a || a == b) return 0;
+    vector<uint32_t> identifiers; collect(a, &identifiers);
+    Paint result = 0;
+    for (size_t i = 0; i < identifiers.size(); ++i)
+      if (!has(b, identifiers[i])) result = insert(result, identifiers[i]);
+    return result;
+  }
+
+private:
+  vector<PaintNode> nodes_;
+
+  static unsigned priority(uint32_t identifier)
+  {
+    unsigned h = identifier + 0x9e3779b9u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return h;
+  }
+
+  Paint make_node(uint32_t identifier, unsigned p, Paint left, Paint right)
+  {
+    if (nodes_.size() >= numeric_limits<uint32_t>::max())
+      throw runtime_error("macro paint storage limit");
+    const size_t size = 1 + (left ? nodes_[left].size : 0) + (right ? nodes_[right].size : 0);
+    nodes_.push_back(PaintNode(identifier, p, left, right, size));
+    return static_cast<Paint>(nodes_.size() - 1);
+  }
+
+  void split(Paint root, uint32_t key, Paint * left, Paint * right)
+  {
+    if (!root) { *left = *right = 0; return; }
+    const PaintNode node = nodes_[root]; // recursive append may reallocate nodes_
+    if (key < node.identifier)
+    {
+      Paint a, b; split(node.left, key, &a, &b);
+      *left = a; *right = make_node(node.identifier, node.priority, b, node.right);
+    }
+    else
+    {
+      Paint a, b; split(node.right, key, &a, &b);
+      *left = make_node(node.identifier, node.priority, node.left, a); *right = b;
+    }
+  }
+
+  Paint insert_missing(Paint root, uint32_t identifier)
+  {
+    if (!root) return make_node(identifier, priority(identifier), 0, 0);
+    const PaintNode node = nodes_[root];
+    const unsigned p = priority(identifier);
+    if (p < node.priority)
+    {
+      Paint left, right; split(root, identifier, &left, &right);
+      return make_node(identifier, p, left, right);
+    }
+    if (identifier < node.identifier)
+    {
+      const Paint left = insert_missing(node.left, identifier);
+      return make_node(node.identifier, node.priority, left, node.right);
+    }
+    const Paint right = insert_missing(node.right, identifier);
+    return make_node(node.identifier, node.priority, node.left, right);
+  }
+
+  void collect(Paint root, vector<uint32_t> * out) const
+  {
+    if (!root) return;
+    const PaintNode & node = nodes_[root];
+    collect(node.left, out); out->push_back(node.identifier); collect(node.right, out);
+  }
 };
 
 class IdentifierTable
 {
 public:
-  IdentifierTable() : next_recent_(0)
+  IdentifierTable() : next_recent_(0), size_(0)
   {
+    entries_.resize(16);
     for (size_t i = 0; i < 8; ++i) recent_[i].valid = false;
   }
+
   uint32_t intern(const string & spelling)
   {
     for (size_t i = 0; i < 8; ++i)
       if (recent_[i].valid && recent_[i].spelling == spelling) return recent_[i].id;
-    unordered_map<string, uint32_t>::const_iterator found = ids_.find(spelling);
+    size_t slot = find_slot(spelling);
     uint32_t id;
-    if (found != ids_.end()) id = found->second;
+    if (entries_[slot].occupied) id = entries_[slot].id;
     else
     {
+      if ((size_ + 1) * 10 >= entries_.size() * 7)
+      {
+        rehash(entries_.size() * 2);
+        slot = find_slot(spelling);
+      }
       id = static_cast<uint32_t>(names_.size());
-      pair<unordered_map<string, uint32_t>::iterator, bool> inserted =
-        ids_.insert(make_pair(spelling, id));
-      names_.push_back(&inserted.first->first);
+      entries_[slot].spelling = spelling;
+      entries_[slot].id = id;
+      entries_[slot].occupied = true;
+      names_.push_back(static_cast<uint32_t>(slot));
+      ++size_;
     }
     recent_[next_recent_].spelling = spelling;
     recent_[next_recent_].id = id;
@@ -80,17 +213,52 @@ public:
     next_recent_ = (next_recent_ + 1) % 8;
     return id;
   }
+
   const string & spelling(uint32_t id) const
   {
     static const string empty;
-    return id < names_.size() ? *names_[id] : empty;
+    if (id >= names_.size()) return empty;
+    return entries_[names_[id]].spelling;
   }
+
 private:
+  struct Entry {
+    string spelling;
+    uint32_t id;
+    bool occupied;
+    Entry() : id(0), occupied(false) {}
+  };
   struct Recent { string spelling; uint32_t id; bool valid; };
-  unordered_map<string, uint32_t> ids_;
-  vector<const string *> names_;
+  vector<Entry> entries_;
+  vector<uint32_t> names_;
   Recent recent_[8];
   size_t next_recent_;
+  size_t size_;
+
+  size_t find_slot(const string & spelling) const
+  {
+    const size_t mask = entries_.size() - 1;
+    size_t slot = hash<string>()(spelling) & mask;
+    while (entries_[slot].occupied && entries_[slot].spelling != spelling)
+      slot = (slot + 1) & mask;
+    return slot;
+  }
+
+  void rehash(size_t capacity)
+  {
+    vector<Entry> old;
+    old.swap(entries_);
+    entries_.resize(capacity);
+    for (size_t i = 0; i < old.size(); ++i)
+    {
+      if (!old[i].occupied) continue;
+      const size_t slot = find_slot(old[i].spelling);
+      entries_[slot].spelling = std::move(old[i].spelling);
+      entries_[slot].id = old[i].id;
+      entries_[slot].occupied = true;
+      names_[entries_[slot].id] = static_cast<uint32_t>(slot);
+    }
+  }
 };
 
 struct Token
@@ -99,7 +267,7 @@ struct Token
   string text_storage;
   const IdentifierTable * identifier_table;
   uint32_t identifier_id;
-  shared_ptr<const string> file;
+  uint32_t file_id;
   size_t line, column, presumed_line;
   Paint unavailable;
   Paint inherited_paint;
@@ -107,106 +275,14 @@ struct Token
   bool paste_operator, stringize_operator;
   Token(TokenKind k = TK_OTHER, const string & s = string(), size_t l = 1,
         size_t c = 1) : kind(k), text_storage(s), identifier_table(0),
-                         identifier_id(0), line(l), column(c), presumed_line(l),
-                         from_macro(false), paste_operator(false), stringize_operator(false) {}
+                         identifier_id(0), file_id(0), line(l), column(c), presumed_line(l),
+                         unavailable(0), inherited_paint(0), from_macro(false), paste_operator(false), stringize_operator(false) {}
   const string & spelling() const
   {
     return kind == TK_IDENTIFIER && identifier_table
       ? identifier_table->spelling(identifier_id) : text_storage;
   }
 };
-
-unsigned paint_priority(const string & name)
-{
-  unsigned h = 2166136261u;
-  for (size_t i = 0; i < name.size(); ++i) { h ^= static_cast<unsigned char>(name[i]); h *= 16777619u; }
-  h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
-  return h;
-}
-Paint make_paint_node(const string & name, unsigned priority, const Paint & left, const Paint & right)
-{ return Paint(new PaintNode(name, priority, left, right)); }
-void paint_split(const Paint & root, const string & key, Paint * left, Paint * right)
-{
-  if (!root) { left->reset(); right->reset(); return; }
-  if (key < root->name)
-  {
-    Paint a, b; paint_split(root->left, key, &a, &b);
-    *left = a; *right = make_paint_node(root->name, root->priority, b, root->right);
-  }
-  else
-  {
-    Paint a, b; paint_split(root->right, key, &a, &b);
-    *left = make_paint_node(root->name, root->priority, root->left, a); *right = b;
-  }
-}
-bool has_paint(const Paint & root, const string & name)
-{
-  Paint node = root;
-  while (node)
-  {
-    if (name == node->name) return true;
-    node = name < node->name ? node->left : node->right;
-  }
-  return false;
-}
-Paint insert_paint_missing(const Paint & root, const string & name)
-{
-  if (!root) return make_paint_node(name, paint_priority(name), Paint(), Paint());
-  if (name == root->name) return root;
-  const unsigned priority = paint_priority(name);
-  if (priority < root->priority)
-  {
-    Paint left, right; paint_split(root, name, &left, &right);
-    return make_paint_node(name, priority, left, right);
-  }
-  if (name < root->name)
-  {
-    Paint left = insert_paint_missing(root->left, name);
-    if (left == root->left) return root;
-    return make_paint_node(root->name, root->priority, left, root->right);
-  }
-  Paint right = insert_paint_missing(root->right, name);
-  if (right == root->right) return root;
-  return make_paint_node(root->name, root->priority, root->left, right);
-}
-Paint insert_paint(const Paint & root, const string & name)
-{
-  if (has_paint(root, name)) return root;
-  return insert_paint_missing(root, name);
-}
-void paint_collect(const Paint & root, vector<string> * out)
-{
-  if (!root) return;
-  paint_collect(root->left, out); out->push_back(root->name); paint_collect(root->right, out);
-}
-Paint intersect_names(const Paint & a, const Paint & b)
-{
-  if (a == b) return a;
-  vector<string> names; paint_collect(a && (!b || a->size <= b->size) ? a : b, &names);
-  const Paint & other = a && (!b || a->size <= b->size) ? b : a;
-  Paint result;
-  for (size_t i = 0; i < names.size(); ++i)
-    if (has_paint(other, names[i])) result = insert_paint(result, names[i]);
-  return result;
-}
-Paint unite_paints(const Paint & a, const Paint & b)
-{
-  if (a == b) return a;
-  vector<string> names; paint_collect(b, &names);
-  Paint result = a;
-  for (size_t i = 0; i < names.size(); ++i) result = insert_paint(result, names[i]);
-  return result;
-}
-Paint difference_paints(const Paint & a, const Paint & b)
-{
-  if (!a || a == b) return Paint();
-  vector<string> names; paint_collect(a, &names);
-  Paint result;
-  for (size_t i = 0; i < names.size(); ++i)
-    if (!has_paint(b, names[i])) result = insert_paint(result, names[i]);
-  return result;
-}
-
 
 bool is_space(const Token & t) { return t.kind == TK_SPACE || t.kind == TK_NEWLINE; }
 bool is_identifier(const Token & t) { return t.kind == TK_IDENTIFIER; }
@@ -220,8 +296,6 @@ size_t skip_space(const vector<Token> & ts, size_t at)
   while (at < ts.size() && is_space(ts[at])) ++at;
   return at;
 }
-bool contains_name(const Paint & names, const string & name) { return has_paint(names, name); }
-void add_name(Paint * names, const string & name) { *names = insert_paint(*names, name); }
 
 class TokenCollector : public IPPTokenStream
 {
@@ -333,9 +407,135 @@ struct Macro
 {
   enum Builtin { NONE, LINE, FILE, DATE, TIME, COUNTER, HAS_ATTRIBUTE } builtin;
   bool function_like, variadic;
-  vector<string> params;
+  vector<uint32_t> params;
   vector<Token> replacement;
+  vector<uint32_t> replacement_parameter_index;
   Macro() : builtin(NONE), function_like(false), variadic(false) {}
+};
+
+class MacroTable
+{
+public:
+  MacroTable() : size_(0), used_(0), deleted_(0) { slots_.resize(16); }
+
+  void clear()
+  {
+    for (size_t i = 0; i < slots_.size(); ++i)
+    {
+      slots_[i].macro = Macro();
+      slots_[i].state = EMPTY;
+    }
+    size_ = used_ = deleted_ = 0;
+  }
+
+  Macro * find(uint32_t key)
+  {
+    const size_t slot = find_existing(key);
+    return slot == slots_.size() ? 0 : &slots_[slot].macro;
+  }
+
+  const Macro * find(uint32_t key) const
+  {
+    const size_t slot = find_existing(key);
+    return slot == slots_.size() ? 0 : &slots_[slot].macro;
+  }
+
+  void set(uint32_t key, Macro macro)
+  {
+    if ((used_ + 1) * 10 >= slots_.size() * 7)
+      rehash((size_ + 1) * 10 >= slots_.size() * 7
+               ? slots_.size() * 2 : slots_.size());
+    bool found = false;
+    const size_t slot = find_insert(key, &found);
+    Entry & entry = slots_[slot];
+    if (!found)
+    {
+      if (entry.state == EMPTY) ++used_;
+      else --deleted_;
+      entry.key = key; entry.state = LIVE; ++size_;
+    }
+    entry.macro = std::move(macro);
+  }
+
+  bool erase(uint32_t key)
+  {
+    const size_t slot = find_existing(key);
+    if (slot == slots_.size()) return false;
+    slots_[slot].macro = Macro();
+    slots_[slot].state = DELETED;
+    --size_; ++deleted_;
+    return true;
+  }
+
+private:
+  enum State { EMPTY, LIVE, DELETED };
+  struct Entry {
+    uint32_t key;
+    unsigned char state;
+    Macro macro;
+    Entry() : key(0), state(EMPTY) {}
+  };
+  vector<Entry> slots_;
+  size_t size_, used_, deleted_;
+
+  static size_t hash_key(uint32_t key)
+  {
+    unsigned h = key + 0x9e3779b9u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return h;
+  }
+
+  size_t find_existing(uint32_t key) const
+  {
+    const size_t mask = slots_.size() - 1;
+    size_t slot = hash_key(key) & mask;
+    while (slots_[slot].state != EMPTY)
+    {
+      if (slots_[slot].state == LIVE && slots_[slot].key == key) return slot;
+      slot = (slot + 1) & mask;
+    }
+    return slots_.size();
+  }
+
+  size_t find_insert(uint32_t key, bool * found) const
+  {
+    const size_t mask = slots_.size() - 1;
+    size_t slot = hash_key(key) & mask;
+    size_t first_deleted = slots_.size();
+    for (;;)
+    {
+      const Entry & entry = slots_[slot];
+      if (entry.state == EMPTY)
+      {
+        *found = false;
+        return first_deleted == slots_.size() ? slot : first_deleted;
+      }
+      if (entry.state == LIVE && entry.key == key)
+      {
+        *found = true; return slot;
+      }
+      if (entry.state == DELETED && first_deleted == slots_.size())
+        first_deleted = slot;
+      slot = (slot + 1) & mask;
+    }
+  }
+
+  void rehash(size_t capacity)
+  {
+    vector<Entry> old; old.swap(slots_);
+    slots_.resize(capacity);
+    size_ = used_ = deleted_ = 0;
+    for (size_t i = 0; i < old.size(); ++i)
+    {
+      if (old[i].state != LIVE) continue;
+      bool found = false;
+      const size_t slot = find_insert(old[i].key, &found);
+      slots_[slot].key = old[i].key;
+      slots_[slot].state = LIVE;
+      slots_[slot].macro = std::move(old[i].macro);
+      ++size_; ++used_;
+    }
+  }
 };
 
 struct FileIdHash
@@ -348,7 +548,10 @@ class Preprocessor
 {
 public:
   explicit Preprocessor(const string & date, const string & time)
-    : date_(date), time_(time), counter_(0), post_(0) {}
+    : date_(date), time_(time), va_args_id_(0), pragma_id_(0), defined_id_(0),
+      true_id_(0), false_id_(0), once_id_(0), has_cpp_attribute_id_(0),
+      no_unique_address_id_(0), no_unique_address_alt_id_(0),
+      counter_(0), post_(0) {}
 
   void begin_translation_unit(IPPTokenStream & output)
   {
@@ -356,6 +559,15 @@ public:
     once_.clear();
     counter_ = 0;
     post_ = &output;
+    va_args_id_ = identifiers_.intern("__VA_ARGS__");
+    pragma_id_ = identifiers_.intern("_Pragma");
+    defined_id_ = identifiers_.intern("defined");
+    true_id_ = identifiers_.intern("true");
+    false_id_ = identifiers_.intern("false");
+    once_id_ = identifiers_.intern("once");
+    has_cpp_attribute_id_ = identifiers_.intern("__has_cpp_attribute");
+    no_unique_address_id_ = identifiers_.intern("no_unique_address");
+    no_unique_address_alt_id_ = identifiers_.intern("__no_unique_address__");
     define_builtin("__CPPGM__", "201303L");
     define_builtin("__cplusplus", "201103L");
     define_builtin("__STDC_HOSTED__", "1");
@@ -367,7 +579,7 @@ public:
     define_builtin("__COUNTER__", "", Macro::COUNTER);
     Macro attr; attr.function_like = true; attr.variadic = true;
     attr.builtin = Macro::HAS_ATTRIBUTE;
-    macros_["__has_cpp_attribute"] = attr;
+    macros_.set(has_cpp_attribute_id_, std::move(attr));
   }
 
   void run_primary(const string & path)
@@ -375,11 +587,34 @@ public:
     process_file(path, 0);
   }
 
+  uint32_t intern_file(const string & path)
+  {
+    unordered_map<string, uint32_t>::const_iterator found = file_ids_.find(path);
+    if (found != file_ids_.end()) return found->second;
+    if (file_names_.size() >= numeric_limits<uint32_t>::max())
+      throw runtime_error("source file identity limit");
+    const uint32_t id = static_cast<uint32_t>(file_names_.size());
+    file_names_.push_back(path);
+    file_ids_[path] = id;
+    return id;
+  }
+
+  const string & file_name(uint32_t id) const
+  {
+    static const string empty;
+    return id < file_names_.size() ? file_names_[id] : empty;
+  }
+
 private:
   string date_, time_;
-  unordered_map<string, Macro> macros_;
+  MacroTable macros_;
   IdentifierTable identifiers_;
+  PaintTable paints_;
+  uint32_t va_args_id_, pragma_id_, defined_id_, true_id_, false_id_, once_id_;
+  uint32_t has_cpp_attribute_id_, no_unique_address_id_, no_unique_address_alt_id_;
   unordered_set<PreprocessorFileId, FileIdHash> once_;
+  deque<string> file_names_;
+  unordered_map<string, uint32_t> file_ids_;
   unsigned long long counter_;
   IPPTokenStream * post_;
 
@@ -392,12 +627,12 @@ private:
       try { m.replacement = tokenize(replacement); }
       catch (...) { m.replacement.clear(); }
     }
-    macros_[name] = m;
+    macros_.set(identifiers_.intern(name), std::move(m));
   }
 
-  void locate(Token * t, const shared_ptr<const string> & file, long long line_delta)
+  void locate(Token * t, uint32_t file_id, long long line_delta)
   {
-    t->file = file;
+    t->file_id = file_id;
     long long line = static_cast<long long>(t->line) + line_delta;
     t->presumed_line = line > 0 ? static_cast<size_t>(line) : 1;
   }
@@ -409,20 +644,17 @@ private:
     if (a.function_like != b.function_like || a.variadic != b.variadic ||
         a.params.size() != b.params.size() || a.replacement.size() != b.replacement.size())
       return false;
-    unordered_map<string, size_t> amap, bmap;
     for (size_t i = 0; i < a.params.size(); ++i)
-    {
       if (a.params[i] != b.params[i]) return false;
-      amap[a.params[i]] = i; bmap[b.params[i]] = i;
-    }
     for (size_t i = 0; i < a.replacement.size(); ++i)
     {
       const Token & x = a.replacement[i], &y = b.replacement[i];
       if (x.kind != y.kind) return false;
-      string xs = x.spelling(), ys = y.spelling();
-      if (x.kind == TK_IDENTIFIER && amap.count(xs)) xs = "$" + to_string(amap[xs]);
-      if (y.kind == TK_IDENTIFIER && bmap.count(ys)) ys = "$" + to_string(bmap[ys]);
-      if (xs != ys) return false;
+      if (x.kind == TK_IDENTIFIER)
+      {
+        if (x.identifier_id != y.identifier_id) return false;
+      }
+      else if (x.spelling() != y.spelling()) return false;
     }
     return true;
   }
@@ -443,19 +675,13 @@ private:
     return result;
   }
 
-  static string canonical_parameter(const Token & t,
-                                    const unordered_map<string, size_t> & params)
-  {
-    if (t.kind == TK_IDENTIFIER && params.count(t.spelling()))
-      return "$" + to_string(params.find(t.spelling())->second);
-    return t.spelling();
-  }
 
   void define_macro(const vector<Token> & line, size_t at)
   {
     if (at >= line.size() || !is_identifier(line[at])) throw runtime_error("invalid #define");
+    const uint32_t name_id = line[at].identifier_id;
     const string name = line[at].spelling();
-    if (name == "__VA_ARGS__") throw runtime_error("invalid macro name");
+    if (name_id == va_args_id_) throw runtime_error("invalid macro name");
     ++at;
     Macro m;
     if (at < line.size() && line[at].kind == TK_PUNCT && line[at].spelling() == "(")
@@ -482,7 +708,7 @@ private:
           }
           if (!is_identifier(line[at]) || line[at].spelling() == "__VA_ARGS__")
             throw runtime_error("invalid macro parameter");
-          const string param = line[at++].spelling();
+          const uint32_t param = line[at++].identifier_id;
           if (find(m.params.begin(), m.params.end(), param) != m.params.end())
             throw runtime_error("duplicate macro parameter");
           m.params.push_back(param); need_param = false;
@@ -502,11 +728,22 @@ private:
       if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "##") m.replacement[i].paste_operator = true;
       if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "#") m.replacement[i].stringize_operator = true;
     }
-    unordered_map<string, size_t> param_map;
+    unordered_map<uint32_t, size_t> param_map;
     for (size_t i = 0; i < m.params.size(); ++i) param_map[m.params[i]] = i;
+    const uint32_t no_parameter = numeric_limits<uint32_t>::max();
+    m.replacement_parameter_index.assign(m.replacement.size(), no_parameter);
     for (size_t i = 0; i < m.replacement.size(); ++i)
     {
-      if (m.replacement[i].kind == TK_IDENTIFIER && m.replacement[i].spelling() == "__VA_ARGS__" && !m.variadic)
+      if (is_identifier(m.replacement[i]))
+      {
+        unordered_map<uint32_t, size_t>::const_iterator parameter =
+          param_map.find(m.replacement[i].identifier_id);
+        if (parameter != param_map.end())
+          m.replacement_parameter_index[i] = static_cast<uint32_t>(parameter->second);
+        else if (m.variadic && m.replacement[i].identifier_id == va_args_id_)
+          m.replacement_parameter_index[i] = static_cast<uint32_t>(m.params.size());
+      }
+      if (m.replacement[i].kind == TK_IDENTIFIER && m.replacement[i].identifier_id == va_args_id_ && !m.variadic)
         throw runtime_error("__VA_ARGS__ used outside variadic macro");
       if (m.replacement[i].kind == TK_PUNCT && m.replacement[i].spelling() == "#")
       {
@@ -517,8 +754,8 @@ private:
         if (!paste_operand)
         {
           if (!m.function_like || after >= m.replacement.size() ||
-              !(is_identifier(m.replacement[after]) && (param_map.count(m.replacement[after].spelling()) ||
-                (m.variadic && m.replacement[after].spelling() == "__VA_ARGS__"))))
+              !(is_identifier(m.replacement[after]) && (param_map.count(m.replacement[after].identifier_id) ||
+                (m.variadic && m.replacement[after].identifier_id == va_args_id_))))
             throw runtime_error("invalid stringizing operator");
         }
       }
@@ -532,13 +769,13 @@ private:
           throw runtime_error("invalid token paste operator");
       }
     }
-    const unordered_map<string, Macro>::iterator found = macros_.find(name);
-    if (found != macros_.end())
+    Macro * found = macros_.find(name_id);
+    if (found)
     {
-      if (!same_definition(found->second, m)) throw runtime_error("incompatible macro redefinition");
+      if (!same_definition(*found, m)) throw runtime_error("incompatible macro redefinition");
       return;
     }
-    macros_[name] = m;
+    macros_.set(name_id, std::move(m));
   }
 
   bool parse_arguments(const deque<Token> & work, size_t open_index,
@@ -590,8 +827,8 @@ private:
       result.identifier_table = &identifiers_;
       result.text_storage.clear();
     }
-    result.file = head.file; result.line = head.line; result.presumed_line = head.presumed_line;
-    result.unavailable = unite_paints(left.unavailable, right.unavailable);
+    result.file_id = head.file_id; result.line = head.line; result.presumed_line = head.presumed_line;
+    result.unavailable = paints_.unite(left.unavailable, right.unavailable);
     result.inherited_paint = head.unavailable;
     result.from_macro = true;
     (void)macro_name;
@@ -633,7 +870,7 @@ private:
 
   enum BuiltinResult { BUILTIN_REPLACED, BUILTIN_NOT_INVOKED, BUILTIN_DEFERRED };
 
-  BuiltinResult expand_builtin(Token & head, const string & name,
+  BuiltinResult expand_builtin(Token & head, uint32_t macro_id,
                                const Macro & macro, deque<Token> & work,
                                bool final, vector<Token> * deferred)
   {
@@ -663,8 +900,8 @@ private:
       {
         size_t ai = skip_space(builtin_args[0], 0);
         if (ai < builtin_args[0].size() && is_identifier(builtin_args[0][ai]) &&
-            (builtin_args[0][ai].spelling() == "no_unique_address" ||
-             builtin_args[0][ai].spelling() == "__no_unique_address__"))
+            (builtin_args[0][ai].identifier_id == no_unique_address_id_ ||
+             builtin_args[0][ai].identifier_id == no_unique_address_alt_id_))
           known_attribute = true;
       }
     }
@@ -672,7 +909,7 @@ private:
     if (macro.builtin == Macro::LINE)
       replacement = Token(TK_NUMBER, to_string(head.presumed_line), head.line, head.column);
     else if (macro.builtin == Macro::FILE)
-      replacement = Token(TK_STRING, quote_string(head.file ? *head.file : string()), head.line, head.column);
+      replacement = Token(TK_STRING, quote_string(file_name(head.file_id)), head.line, head.column);
     else if (macro.builtin == Macro::DATE)
       replacement = Token(TK_STRING, macro.replacement.empty() ? date_ : macro.replacement[0].spelling(), head.line, head.column);
     else if (macro.builtin == Macro::TIME)
@@ -681,8 +918,8 @@ private:
       replacement = Token(TK_NUMBER, to_string(counter_++), head.line, head.column);
     else
       replacement = Token(TK_NUMBER, known_attribute ? "201803" : "0", head.line, head.column);
-    replacement.file = head.file; replacement.presumed_line = head.presumed_line;
-    replacement.unavailable = head.unavailable; add_name(&replacement.unavailable, name);
+    replacement.file_id = head.file_id; replacement.presumed_line = head.presumed_line;
+    replacement.unavailable = paints_.insert(head.unavailable, macro_id);
     replacement.inherited_paint = head.unavailable; replacement.from_macro = true;
     work.push_front(std::move(replacement));
     return BUILTIN_REPLACED;
@@ -690,15 +927,17 @@ private:
 
   vector<Token> expand(vector<Token> input, unsigned depth = 0,
                        bool * contains_pragma_operator = 0, bool final = true,
-                       vector<Token> * deferred = 0)
+                       vector<Token> * deferred = 0, size_t * shared_work = 0)
   {
     if (depth > 256) throw runtime_error("macro argument expansion nesting limit");
+    size_t local_work = 0;
+    if (!shared_work) shared_work = &local_work;
     bool possible_macro = false, found_pragma_operator = false;
     for (size_t i = 0; i < input.size(); ++i)
     {
-      if (is_identifier(input[i]) && input[i].spelling() == "_Pragma") found_pragma_operator = true;
-      if (is_identifier(input[i]) && !contains_name(input[i].unavailable, input[i].spelling()) &&
-          macros_.find(input[i].spelling()) != macros_.end()) possible_macro = true;
+      if (is_identifier(input[i]) && input[i].identifier_id == pragma_id_) found_pragma_operator = true;
+      if (is_identifier(input[i]) && !paints_.has(input[i].unavailable, input[i].identifier_id) &&
+          macros_.find(input[i].identifier_id)) possible_macro = true;
     }
     if (!possible_macro && (final || !found_pragma_operator))
     {
@@ -709,27 +948,27 @@ private:
     for (size_t i = 0; i < input.size(); ++i) work.push_back(std::move(input[i]));
     vector<Token>().swap(input);
     vector<Token> output;
-    size_t expansions = 0;
     while (!work.empty())
     {
-      if (++expansions > 10000000) throw runtime_error("macro expansion work limit");
+      if (++*shared_work > 10000000) throw runtime_error("macro expansion work limit");
       Token head = std::move(work.front()); work.pop_front();
-      if (!is_identifier(head) || contains_name(head.unavailable, head.spelling()))
+      if (!is_identifier(head) || paints_.has(head.unavailable, head.identifier_id))
       { output.push_back(std::move(head)); continue; }
-      if (!final && head.spelling() == "_Pragma")
+      if (!final && head.identifier_id == pragma_id_)
       {
         if (deferred) deferred->push_back(std::move(head));
         while (!work.empty()) { if (deferred) deferred->push_back(std::move(work.front())); work.pop_front(); }
         break;
       }
-      unordered_map<string, Macro>::const_iterator found = macros_.find(head.spelling());
-      if (found == macros_.end()) { output.push_back(std::move(head)); continue; }
+      Macro * found = macros_.find(head.identifier_id);
+      if (!found) { output.push_back(std::move(head)); continue; }
+      const uint32_t macro_id = head.identifier_id;
       const string name = head.spelling();
-      const Macro & macro = found->second;
+      const Macro & macro = *found;
 
       if (macro.builtin != Macro::NONE)
       {
-        const BuiltinResult result = expand_builtin(head, name, macro, work, final, deferred);
+        const BuiltinResult result = expand_builtin(head, macro_id, macro, work, final, deferred);
         if (result == BUILTIN_NOT_INVOKED) output.push_back(std::move(head));
         if (result == BUILTIN_DEFERRED) break;
         continue;
@@ -759,8 +998,8 @@ private:
           break;
         }
         const Paint & closing_paint = work[consumed - 1].unavailable;
-        macro_paint = intersect_names(head.unavailable, closing_paint);
-        add_name(&macro_paint, name);
+        macro_paint = paints_.intersect(head.unavailable, closing_paint);
+        macro_paint = paints_.insert(macro_paint, macro_id);
         const size_t fixed = macro.params.size();
         if (fixed == 0 && !macro.variadic && args.size() == 1 &&
             skip_space(args[0], 0) == args[0].size()) args.clear();
@@ -773,9 +1012,7 @@ private:
         vector<vector<Token> > expanded_args(fixed + (macro.variadic ? 1 : 0));
         vector<bool> expanded_ready(expanded_args.size(), false);
         vector<Token> substituted;
-        unordered_map<string, size_t> param_index;
-        for (size_t i = 0; i < fixed; ++i) param_index[macro.params[i]] = i;
-        if (macro.variadic) param_index["__VA_ARGS__"] = fixed;
+        const uint32_t no_parameter = numeric_limits<uint32_t>::max();
         for (size_t ri = 0; ri < macro.replacement.size(); ++ri)
         {
           const Token & rt = macro.replacement[ri];
@@ -784,15 +1021,14 @@ private:
           size_t hash_before = ri; while (hash_before && is_space(macro.replacement[hash_before - 1])) --hash_before;
           const bool stringize_candidate = rt.stringize_operator &&
             hash_after < macro.replacement.size() && is_identifier(macro.replacement[hash_after]) &&
-            param_index.count(macro.replacement[hash_after].spelling());
+            macro.replacement_parameter_index[hash_after] != no_parameter;
           const bool hash_is_paste = rt.kind == TK_PUNCT && rt.spelling() == "#" && !stringize_candidate &&
             ((hash_after < macro.replacement.size() && macro.replacement[hash_after].kind == TK_PUNCT && macro.replacement[hash_after].spelling() == "##") ||
              (hash_before && macro.replacement[hash_before - 1].kind == TK_PUNCT && macro.replacement[hash_before - 1].spelling() == "##"));
           if (stringize_candidate && !hash_is_paste)
           {
             size_t pi = skip_space(macro.replacement, ri + 1);
-            const string pname = macro.replacement[pi].spelling();
-            size_t ix = param_index.at(pname);
+            const size_t ix = macro.replacement_parameter_index[pi];
             vector<Token> raw;
             if (ix < fixed) raw = args[ix];
             else
@@ -819,15 +1055,16 @@ private:
               }
             }
             Token stringized(TK_STRING, string("\"") + content + "\"", head.line, head.column);
-            stringized.file = head.file; stringized.presumed_line = head.presumed_line;
+            stringized.file_id = head.file_id; stringized.presumed_line = head.presumed_line;
             stringized.unavailable = macro_paint;
             stringized.inherited_paint = head.unavailable; stringized.from_macro = true;
             substituted.push_back(stringized); ri = pi;
             continue;
           }
-          if (is_identifier(rt) && param_index.count(rt.spelling()))
+          const uint32_t parameter_index = macro.replacement_parameter_index[ri];
+          if (is_identifier(rt) && parameter_index != no_parameter)
           {
-            const size_t ix = param_index[rt.spelling()];
+            const size_t ix = parameter_index;
             size_t prev = ri; while (prev && is_space(macro.replacement[prev - 1])) --prev;
             size_t next = ri + 1; while (next < macro.replacement.size() && is_space(macro.replacement[next])) ++next;
             const bool pasted = (prev && macro.replacement[prev - 1].kind == TK_PUNCT && macro.replacement[prev - 1].spelling() == "##") ||
@@ -845,24 +1082,28 @@ private:
             if (values.empty() && pasted) values.push_back(Token(TK_PLACEMARK, ""));
             else if (!pasted)
             {
-              if (!expanded_ready[ix]) { expanded_args[ix] = expand(std::move(values), depth + 1); expanded_ready[ix] = true; }
+              if (!expanded_ready[ix])
+              {
+                expanded_args[ix] = expand(std::move(values), depth + 1, 0, true, 0, shared_work);
+                expanded_ready[ix] = true;
+              }
               values = expanded_args[ix];
             }
             for (size_t q = 0; q < values.size(); ++q)
             {
               Token value = values[q];
-              if (is_identifier(value) && macros_.find(value.spelling()) != macros_.end())
+              if (is_identifier(value) && macros_.find(value.identifier_id) != 0)
               {
                 if (value.from_macro)
                 {
-                  value.unavailable = difference_paints(value.unavailable, value.inherited_paint);
-                  Paint current; add_name(&current, name);
-                  value.unavailable = unite_paints(value.unavailable, current);
+                  value.unavailable = paints_.difference(value.unavailable, value.inherited_paint);
+                  Paint current = paints_.insert(0, macro_id);
+                  value.unavailable = paints_.unite(value.unavailable, current);
                 }
                 else
                 {
-                  value.unavailable = unite_paints(value.unavailable, head.unavailable);
-                  value.unavailable = unite_paints(value.unavailable, macro_paint);
+                  value.unavailable = paints_.unite(value.unavailable, head.unavailable);
+                  value.unavailable = paints_.unite(value.unavailable, macro_paint);
                 }
                 value.inherited_paint = head.unavailable;
                 value.from_macro = true;
@@ -872,7 +1113,7 @@ private:
             continue;
           }
           Token copy = rt;
-          copy.file = head.file; copy.line = head.line; copy.column = head.column;
+          copy.file_id = head.file_id; copy.line = head.line; copy.column = head.column;
           copy.presumed_line = head.presumed_line;
           copy.unavailable = macro_paint;
           copy.inherited_paint = head.unavailable; copy.from_macro = true;
@@ -887,9 +1128,9 @@ private:
         body = macro.replacement;
         for (size_t q = 0; q < body.size(); ++q)
         {
-          body[q].file = head.file; body[q].line = head.line; body[q].column = head.column;
+          body[q].file_id = head.file_id; body[q].line = head.line; body[q].column = head.column;
           body[q].presumed_line = head.presumed_line;
-          body[q].unavailable = head.unavailable; add_name(&body[q].unavailable, name);
+          body[q].unavailable = paints_.insert(head.unavailable, macro_id);
           body[q].inherited_paint = head.unavailable; body[q].from_macro = true;
         }
         bool has_paste = false;
@@ -909,7 +1150,7 @@ private:
     {
       if (!found_pragma_operator)
         for (size_t i = 0; i < output.size(); ++i)
-          if (is_identifier(output[i]) && output[i].spelling() == "_Pragma") { found_pragma_operator = true; break; }
+          if (is_identifier(output[i]) && output[i].identifier_id == pragma_id_) { found_pragma_operator = true; break; }
       *contains_pragma_operator = found_pragma_operator;
     }
     return output;
@@ -921,7 +1162,7 @@ private:
     vector<Token> protected_tokens;
     for (size_t i = 0; i < expression.size(); ++i)
     {
-      if (is_identifier(expression[i]) && expression[i].spelling() == "defined")
+      if (is_identifier(expression[i]) && expression[i].identifier_id == defined_id_)
       {
         size_t j = skip_space(expression, i + 1); bool paren = false;
         if (j < expression.size() && expression[j].kind == TK_PUNCT && expression[j].spelling() == "(")
@@ -930,7 +1171,7 @@ private:
             (expression[j].kind == TK_PUNCT && is_alternative_word(expression[j].spelling()))))
           throw runtime_error("invalid defined operator");
         const string operand = expression[j].spelling();
-        const bool exists = macros_.find(operand) != macros_.end();
+        const bool exists = macros_.find(expression[j].identifier_id) != 0;
         ++j; j = skip_space(expression, j);
         if (paren)
         {
@@ -939,7 +1180,7 @@ private:
           ++j;
         }
         Token value(TK_NUMBER, exists ? "1" : "0", expression[i].line, expression[i].column);
-        value.file = expression[i].file; value.presumed_line = expression[i].presumed_line;
+        value.file_id = expression[i].file_id; value.presumed_line = expression[i].presumed_line;
         protected_tokens.push_back(value); i = j - 1;
       }
       else protected_tokens.push_back(expression[i]);
@@ -952,7 +1193,7 @@ private:
       if (is_space(t)) continue;
       if (t.kind == TK_IDENTIFIER)
       {
-        if (t.spelling() == "true" || t.spelling() == "false")
+        if (t.identifier_id == true_id_ || t.identifier_id == false_id_)
           operands.push_back(ControlExpressionToken(ControlExpressionToken::IDENTIFIER, t.spelling()));
         else operands.push_back(ControlExpressionToken(ControlExpressionToken::PP_NUMBER, "0"));
       }
@@ -987,13 +1228,13 @@ private:
   {
     bool has_pragma_operator = false;
     for (size_t i = 0; i < tokens->size(); ++i)
-      if (is_identifier((*tokens)[i]) && (*tokens)[i].spelling() == "_Pragma") { has_pragma_operator = true; break; }
+      if (is_identifier((*tokens)[i]) && (*tokens)[i].identifier_id == pragma_id_) { has_pragma_operator = true; break; }
     if (!has_pragma_operator) return;
     vector<Token> out;
     for (size_t i = 0; i < tokens->size(); ++i)
     {
       const Token & t = (*tokens)[i];
-      if (!is_identifier(t) || t.spelling() != "_Pragma") { out.push_back(t); continue; }
+      if (!is_identifier(t) || t.identifier_id != pragma_id_) { out.push_back(t); continue; }
       size_t j = skip_space(*tokens, i + 1);
       if (j >= tokens->size() || (*tokens)[j].kind != TK_PUNCT || (*tokens)[j].spelling() != "(")
         throw runtime_error("invalid _Pragma operator");
@@ -1005,7 +1246,7 @@ private:
       size_t end = skip_space(*tokens, j + 1);
       if (end >= tokens->size() || (*tokens)[end].kind != TK_PUNCT || (*tokens)[end].spelling() != ")")
         throw runtime_error("invalid _Pragma invocation");
-      if (pragma == "once") mark_pragma_once(t.file ? *t.file : fallback_file);
+      if (pragma == "once") mark_pragma_once(t.file_id < file_names_.size() ? file_name(t.file_id) : fallback_file);
       i = end;
     }
     tokens->swap(out);
@@ -1022,14 +1263,14 @@ private:
     for (size_t i = 0; i < expanded.size(); ++i)
     {
       const Token & t = expanded[i];
-      post_->set_source_file(t.file ? *t.file : string());
+      post_->set_source_file(file_name(t.file_id));
       post_->set_source_location(t.presumed_line, t.column);
       switch (t.kind)
       {
         case TK_SPACE: case TK_NEWLINE: post_->emit_whitespace_sequence(); break;
         case TK_HEADER: post_->emit_header_name(t.spelling()); break;
         case TK_IDENTIFIER:
-          if (t.spelling() == "__VA_ARGS__") throw runtime_error("__VA_ARGS__ outside variadic macro");
+          if (t.identifier_id == va_args_id_) throw runtime_error("__VA_ARGS__ outside variadic macro");
           post_->emit_identifier(t.spelling()); break;
         case TK_NUMBER: post_->emit_pp_number(t.spelling()); break;
         case TK_CHARACTER: post_->emit_character_literal(t.spelling()); break;
@@ -1082,13 +1323,14 @@ private:
 
   struct FileStream;
   void process_line(FileStream &);
+  void process_line_contents(FileStream &);
 
   struct FileStream : IPPTokenStream
   {
     Preprocessor & owner;
     unsigned include_depth;
     string presumed_file;
-    shared_ptr<const string> presumed_file_ref;
+    uint32_t file_id;
     long long line_delta;
     size_t line, column, physical_end_line;
     vector<Token> current, pending_text;
@@ -1096,7 +1338,7 @@ private:
 
     FileStream(Preprocessor & p, const string & path, unsigned depth)
       : owner(p), include_depth(depth), presumed_file(path),
-        presumed_file_ref(new string(path)), line_delta(0),
+        file_id(p.intern_file(path)), line_delta(0),
         line(1), column(1), physical_end_line(1) {}
 
     void set_source_line(size_t l) { line = l; column = 1; }
@@ -1129,6 +1371,8 @@ private:
         current.clear();
       }
       owner.emit_text(pending_text, presumed_file);
+      pending_text.clear();
+      owner.paints_.reset();
       if (!conditions.empty()) throw runtime_error("unterminated conditional group");
     }
   private:
@@ -1160,9 +1404,15 @@ private:
 };
 
 void Preprocessor::process_line(Preprocessor::FileStream & file)
+{
+  process_line_contents(file);
+  if (file.pending_text.empty()) paints_.reset();
+}
+
+void Preprocessor::process_line_contents(Preprocessor::FileStream & file)
   {
     vector<Token> & line = file.current;
-    for (size_t i = 0; i < line.size(); ++i) locate(&line[i], file.presumed_file_ref, file.line_delta);
+    for (size_t i = 0; i < line.size(); ++i) locate(&line[i], file.file_id, file.line_delta);
     size_t first = skip_space(line, 0);
     const bool is_directive = first < line.size() && is_punct(line[first], "#");
     if (!is_directive)
@@ -1174,7 +1424,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         for (size_t i = 0; i < line.size(); ++i)
           candidate.push_back(std::move(line[i]));
         candidate.push_back(Token(TK_SPACE));
-        locate(&candidate.back(), file.presumed_file_ref, file.line_delta);
+        locate(&candidate.back(), file.file_id, file.line_delta);
         vector<Token> deferred;
         emit_text(candidate, file.presumed_file, false, &deferred);
         file.pending_text = std::move(deferred);
@@ -1204,7 +1454,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         {
           size_t a = skip_space(args, 0);
           if (a >= args.size() || !is_identifier(args[a])) throw runtime_error("invalid conditional identifier");
-          const bool defined = macros_.find(args[a].spelling()) != macros_.end();
+          const bool defined = macros_.find(args[a].identifier_id) != 0;
           size_t tail = skip_space(args, a + 1);
           if (tail != args.size()) throw runtime_error("extra conditional tokens");
           value = directive == "ifdef" ? defined : !defined;
@@ -1248,9 +1498,9 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
     else if (directive == "undef")
     {
       size_t a = skip_space(args, 0);
-      if (a >= args.size() || !is_identifier(args[a]) || args[a].spelling() == "__VA_ARGS__" ||
+      if (a >= args.size() || !is_identifier(args[a]) || args[a].identifier_id == va_args_id_ ||
           skip_space(args, a + 1) != args.size()) throw runtime_error("invalid #undef");
-      macros_.erase(args[a].spelling());
+      macros_.erase(args[a].identifier_id);
     }
     else if (directive == "include")
     {
@@ -1276,7 +1526,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
         string filename;
         if (!decode_string_literal(expanded[b].spelling(), &filename)) throw runtime_error("invalid #line filename");
         file.presumed_file = filename;
-        file.presumed_file_ref.reset(new string(filename));
+        file.file_id = intern_file(filename);
       }
       else if (b != expanded.size()) throw runtime_error("invalid #line tokens");
       const size_t physical_next = file.physical_end_line + 1;
@@ -1286,7 +1536,7 @@ void Preprocessor::process_line(Preprocessor::FileStream & file)
     else if (directive == "pragma")
     {
       const size_t a = skip_space(args, 0);
-      if (a < args.size() && is_identifier(args[a]) && args[a].spelling() == "once")
+      if (a < args.size() && is_identifier(args[a]) && args[a].identifier_id == once_id_)
         mark_pragma_once(file.presumed_file);
       // Unknown pragmas are deliberately ignored.
     }
