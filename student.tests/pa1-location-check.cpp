@@ -83,5 +83,35 @@ int main()
       return 1;
     }
   }
+
+  // The physical quote follows a phase-2 splice. Its byte offset and source
+  // location must be used when scanning the raw body and resuming afterward.
+  const std::string spliced_prefix = "R\\\n\"(body)\"x\ny\n";
+  RecordingStream spliced_stream;
+  PPTokenizer spliced_tokenizer(spliced_prefix, spliced_stream);
+  spliced_tokenizer.tokenize();
+  const char * spliced_expected[] = {
+    "user-defined-string-literal|R\"(body)\"x|1:1",
+    "new-line||2:10",
+    "identifier|y|3:1",
+    "new-line||3:2",
+    "eof||3:2"
+  };
+  if (spliced_stream.events.size() !=
+      sizeof(spliced_expected) / sizeof(spliced_expected[0]))
+    return 1;
+  for (std::size_t i = 0; i < spliced_stream.events.size(); ++i)
+  {
+    const Event & event = spliced_stream.events[i];
+    std::ostringstream actual;
+    actual << event.type << '|' << event.data << '|'
+           << event.line << ':' << event.column;
+    if (actual.str() != spliced_expected[i])
+    {
+      std::cerr << "spliced event " << i << " mismatch: " << actual.str()
+                << " != " << spliced_expected[i] << '\n';
+      return 1;
+    }
+  }
   return 0;
 }

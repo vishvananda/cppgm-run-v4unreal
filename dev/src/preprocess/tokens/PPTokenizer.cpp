@@ -121,8 +121,7 @@ class Phase12Cursor
 public:
   explicit Phase12Cursor(const std::string & source)
     : source_(source), byte_(0), line_(1), column_(1), phase1_eof_(false),
-      has_pending_phase1_(false), synthetic_emitted_(false), finished_(false),
-      returned_any_(false), last_returned_(kEof)
+      has_pending_phase1_(false), synthetic_emitted_(false), finished_(false)
   {
     if (source_.size() >= 3 &&
         static_cast<unsigned char>(source_[0]) == 0xef &&
@@ -148,13 +147,10 @@ public:
 
       if (current.cp == kEof)
       {
-        if (!source_.empty() && !synthetic_emitted_ &&
-            (!returned_any_ || last_returned_ != '\n'))
+        if (!synthetic_emitted_ && needs_appended_newline())
         {
           synthetic_emitted_ = true;
-          Unit newline('\n', source_.size(), source_.size(), line_, column_);
-          remember(newline);
-          return newline;
+          return Unit('\n', source_.size(), source_.size(), line_, column_);
         }
         finished_ = true;
         return Unit();
@@ -163,6 +159,15 @@ public:
       if (current.cp == '\\')
       {
         Unit following = read_phase1();
+        // Phase 2 sees the phase-2-mandated final newline. It must therefore
+        // splice a final backslash just as it would any other backslash-newline
+        // pair; appending only after tokenization loses this distinction.
+        if (following.cp == kEof && !synthetic_emitted_ &&
+            needs_appended_newline())
+        {
+          synthetic_emitted_ = true;
+          following = Unit('\n', source_.size(), source_.size(), line_, column_);
+        }
         if (following.cp == '\n')
           continue;
         if (following.cp != kEof)
@@ -171,7 +176,6 @@ public:
           has_pending_phase1_ = true;
         }
       }
-      remember(current);
       return current;
     }
   }
@@ -187,8 +191,6 @@ public:
     has_pending_phase1_ = false;
     synthetic_emitted_ = false;
     finished_ = false;
-    returned_any_ = true;
-    last_returned_ = '"';
   }
 
 private:
@@ -202,8 +204,20 @@ private:
   bool has_pending_phase1_;
   bool synthetic_emitted_;
   bool finished_;
-  bool returned_any_;
-  int last_returned_;
+
+  bool needs_appended_newline() const
+  {
+    if (source_.empty())
+      return false;
+    if (source_[source_.size() - 1] != '\n')
+      return true;
+    // A final backslash-newline is removed in phase 2, so phase 2 first
+    // appends another newline. Account for a phase-1 trigraph spelling too.
+    if (source_.size() >= 2 && source_[source_.size() - 2] == '\\')
+      return true;
+    return source_.size() >= 4 &&
+           source_.compare(source_.size() - 4, 3, "?" "?/") == 0;
+  }
 
   Unit decode_physical()
   {
@@ -274,12 +288,6 @@ private:
     }
     phase1_lookahead_.pop_front();
     return first;
-  }
-
-  void remember(const Unit & unit)
-  {
-    returned_any_ = true;
-    last_returned_ = unit.cp;
   }
 };
 
@@ -880,16 +888,24 @@ private:
 
   std::string scan_raw_string(const StringStart & start)
   {
-    const Unit token_start = peek(0);
-    const std::size_t start_byte = token_start.begin;
-    const std::size_t quote_byte = start_byte + start.prefix_length;
-    if (quote_byte >= source_.size() || source_[quote_byte] != '"')
-      throw std::logic_error("raw string prefix does not match source buffer");
+    std::string spelling;
+    for (std::size_t i = 0; i < start.prefix_length; ++i)
+      append_utf8(take().cp, &spelling);
 
-    std::size_t pos = quote_byte + 1;
-    std::string delimiter;
+    const Unit quote = take();
+    if (quote.cp != '"')
+      throw std::logic_error("raw string prefix changed during scan");
+    append_utf8(quote.cp, &spelling);
+
+    // The opening prefix is translated normally, so use the logical quote's
+    // physical range rather than assuming that the prefix occupies adjacent
+    // source bytes (a phase-2 splice may occur inside it).
+    std::size_t pos = quote.end;
     std::vector<int> delimiter_cps;
     bool opened = false;
+    std::size_t line = quote.line;
+    std::size_t column = quote.column;
+    update_location(quote.cp, &line, &column);
     while (pos < source_.size())
     {
       int cp;
@@ -897,6 +913,9 @@ private:
       decode_utf8(source_, pos, &cp, &next);
       if (cp == '(')
       {
+        for (std::size_t i = 0; i < delimiter_cps.size(); ++i)
+          update_location(delimiter_cps[i], &line, &column);
+        update_location(cp, &line, &column);
         pos = next;
         opened = true;
         break;
@@ -905,7 +924,7 @@ private:
           cp == '\v' || cp == '\f' || cp == '\n')
         throw std::runtime_error("invalid raw string delimiter");
       delimiter_cps.push_back(cp);
-      append_utf8(cp, &delimiter);
+      update_location(cp, &line, &column);
       if (delimiter_cps.size() > 16)
         throw std::runtime_error("raw string delimiter exceeds 16 characters");
       pos = next;
@@ -913,10 +932,6 @@ private:
     if (!opened)
       throw std::runtime_error("unterminated raw string literal");
 
-    std::size_t line = token_start.line;
-    std::size_t column = token_start.column;
-    // The prefix, quote, delimiter, and opening parenthesis contain no newlines.
-    column += start.prefix_length + delimiter_cps.size() + 2;
     bool closed = false;
     while (pos < source_.size())
     {
@@ -960,9 +975,12 @@ private:
       throw std::runtime_error("unterminated raw string literal");
 
     const std::size_t end_byte = pos;
+    // From the initial quote through the final quote, phase-1/2 spellings are
+    // reverted; only the possibly spliced prefix is kept in translated form.
+    spelling.append(source_, quote.end, end_byte - quote.end);
     cursor_.reset_after_raw_literal(end_byte, line, column);
     lookahead_.clear();
-    return source_.substr(start_byte, end_byte - start_byte);
+    return spelling;
   }
 
   bool scan_ud_suffix(std::string * suffix)
