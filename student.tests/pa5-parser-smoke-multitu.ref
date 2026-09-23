@@ -1,0 +1,66 @@
+2 translation units
+start translation unit 1
+translation-unit
+  namespace-definition api
+    simple-declaration
+      decl-specifier-seq
+        decl-specifier KW_TYPEDEF:typedef
+        decl-specifier KW_INT:int
+      init-declarator-list
+        init-declarator
+          declarator
+            identifier number
+  template-declaration
+    template-parameter-clause
+      template-parameter-list
+        type-parameter
+          parameter-key KW_CLASS:class
+          identifier T
+    function-definition
+      decl-specifier-seq
+        decl-specifier TT_IDENTIFIER:T
+      declarator
+        identifier identity
+        parameter-clause
+          parameter-declaration
+            decl-specifier-seq
+              decl-specifier TT_IDENTIFIER:T
+            declarator
+              identifier value
+      compound-statement
+        return-statement
+          id-expression value
+  function-definition
+    decl-specifier-seq
+      decl-specifier KW_INT:int
+    declarator
+      identifier main
+      parameter-clause
+    compound-statement
+      simple-declaration
+        decl-specifier-seq
+          decl-specifier api::number
+        init-declarator-list
+          init-declarator
+            declarator
+              identifier value
+            initializer
+              call-expression
+                id-expression identity
+                argument-list
+                  literal 3
+      return-statement
+        id-expression value
+end translation unit
+start translation unit 2
+translation-unit
+  function-definition
+    decl-specifier-seq
+      decl-specifier KW_INT:int
+    declarator
+      identifier helper
+      parameter-clause
+    compound-statement
+      return-statement
+        literal 1
+end translation unit
