@@ -141,13 +141,13 @@ class Parser {
   bool definite_type_start(std::size_t k = 0) const {
     const std::string x = s(k);
     if (x == "typename" || x == "decltype" || x == "class" || x == "struct" ||
-        x == "union" || x == "enum")
+        x == "union" || x == "enum" || x == "nullptr_t")
       return true;
     if (syntax_is_keyword(x) &&
         (x == "bool" || x == "char" || x == "char16_t" || x == "char32_t" ||
          x == "double" || x == "float" || x == "int" || x == "long" ||
          x == "short" || x == "signed" || x == "unsigned" || x == "void" ||
-         x == "wchar_t" || x == "const" || x == "volatile" || x == "auto"))
+         x == "wchar_t" || x == "const" || x == "volatile" || x == "auto" || x == "nullptr_t"))
       return true;
     if (x == "::") {
       std::size_t j = k + 1;
@@ -177,7 +177,7 @@ class Parser {
         "bool",    "char",  "char16_t", "char32_t", "double",   "float",
         "int",     "long",  "short",    "signed",   "unsigned", "void",
         "wchar_t", "const", "volatile", "typename", "decltype", "class",
-        "struct",  "union", "enum",     "auto"};
+        "struct",  "union", "enum",     "auto", "nullptr_t"};
     for (std::size_t i = 0; i < sizeof(b) / sizeof(*b); ++i)
       if (x == b[i])
         return true;
@@ -1237,6 +1237,21 @@ class Parser {
       c.add(parse_expression(1));
       need(")");
       return c;
+    }
+    if (semantic_mode_ && type_start() && !identifier() && !at("::")) {
+      std::size_t save=p_;
+      try {
+        Node sequence=parse_type_specifier_seq(false);
+        if(at("(")) {
+          Node type_id=n("type-id");type_id.add(sequence);
+          need("(");
+          Node cast=n("cast-expression");cast.add(type_id);
+          if(!at(")"))cast.add(parse_expression(1));
+          need(")");
+          return cast;
+        }
+      } catch(const std::exception &) {}
+      p_=save;
     }
     if (type_start() && s(1) == "(" && !identifier()) {
       std::string name = s();
@@ -2616,13 +2631,11 @@ class Parser {
   }
   bool declarator_denotes_function(const Node &d) const {
     const Node *nested=0;
-    bool function_suffix=false, pointer_prefix=false;
+    bool function_suffix=false;
     for(std::size_t i=0;i<d.children.size();++i) {
       if(d.children[i].text=="parameter-clause") function_suffix=true;
-      if(d.children[i].text.find("ptr-operator")==0) pointer_prefix=true;
       if(d.children[i].text=="nested-declarator" && !d.children[i].children.empty())nested=&d.children[i].children[0];
     }
-    if(pointer_prefix)return false;
     if(nested)return declarator_denotes_function(*nested);
     return function_suffix;
   }
@@ -2882,6 +2895,16 @@ class Parser {
       Node f = n("special-member-definition " + name);
       f.add(d);
       f.add(parse_compound());
+      return f;
+    }
+    if(take("=")) {
+      std::string value=s();
+      if(value!="default" && value!="delete")throw std::runtime_error("invalid special-member initializer");
+      ++p_;
+      need(";");
+      Node f=n("special-member-definition "+name);
+      f.add(d);
+      f.add(n("special-initializer "+value));
       return f;
     }
     Node f = n("special-member-declaration " + name);

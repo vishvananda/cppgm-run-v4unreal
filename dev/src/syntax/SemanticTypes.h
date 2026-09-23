@@ -18,7 +18,8 @@ typedef int SemanticFunctionIdentityId;
 
 enum SemanticTypeKind { SEMANTIC_BUILTIN=0, SEMANTIC_CLASS, SEMANTIC_ENUM,
                         SEMANTIC_CV, SEMANTIC_POINTER, SEMANTIC_LVALUE_REFERENCE,
-                        SEMANTIC_RVALUE_REFERENCE, SEMANTIC_ARRAY, SEMANTIC_FUNCTION };
+                        SEMANTIC_RVALUE_REFERENCE, SEMANTIC_ARRAY, SEMANTIC_FUNCTION,
+                        SEMANTIC_MEMBER_POINTER };
 enum SemanticScopeKind { SEMANTIC_SCOPE_UNKNOWN=0, SEMANTIC_NAMESPACE=1,
                          SEMANTIC_CLASS_SCOPE=2, SEMANTIC_ENUM_SCOPE=3,
                          SEMANTIC_FUNCTION_SCOPE=4, SEMANTIC_TEMPLATE_PARAMETERS=5,
@@ -102,14 +103,17 @@ struct SemanticLookupResult {
 class SemanticModel {
   class Impl;
   std::unique_ptr<Impl> impl_;
-  explicit SemanticModel(SyntaxTree &&tree);
-  friend std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree);
+  explicit SemanticModel(SyntaxTree &&tree, bool retain_syntax);
+  friend std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree,
+                                                   bool retain_syntax);
   friend void write_semantic_types(const SemanticModel &model, std::ostream &output);
+void write_call_semantics(SemanticModel &model, std::ostream &output);
 public:
   ~SemanticModel();
   SemanticModel(const SemanticModel &) = delete;
   SemanticModel &operator=(const SemanticModel &) = delete;
 
+  const SyntaxNode &syntax_root() const;
   std::size_t type_count() const;
   std::size_t source_file_count() const;
   std::size_t scope_count() const;
@@ -120,9 +124,11 @@ public:
   const std::string &name_text(SemanticNameId name) const;
   const PostTokenSourceFile &source_file(std::size_t file_id) const;
   SemanticTypeInfo type(SemanticTypeId id) const;
+  SemanticTypeId type_from_syntax(const SyntaxNode &node, SemanticScopeId scope);
   SemanticTypeId type_parameter(SemanticTypeId id, std::size_t index) const;
   SemanticScopeInfo scope(SemanticScopeId id) const;
   SemanticBindingInfo binding(SemanticScopeId scope, std::size_t index) const;
+  std::vector<SemanticBindingInfo> bindings_named(SemanticScopeId scope, SemanticNameId name) const;
   SemanticEntityInfo entity(SemanticEntityId id) const;
   SemanticFunctionSignatureInfo function_signature(SemanticSignatureId id) const;
   SemanticTypeId signature_parameter(SemanticSignatureId id, std::size_t index) const;
@@ -145,7 +151,9 @@ public:
 // Parse once, transfer TU-owned source buffers and build a reusable typed graph.
 // The structured syntax arena and post-token tape are released after analysis;
 // source buffers and compact locations remain owned by the graph.
-std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree);
+std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree,
+                                                   bool retain_syntax = false);
 
 // Deterministic PA6 text is a view over the same graph used by later modes.
 void write_semantic_types(const SemanticModel &model, std::ostream &output);
+void write_call_semantics(SemanticModel &model, std::ostream &output);

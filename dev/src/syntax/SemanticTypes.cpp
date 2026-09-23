@@ -17,7 +17,7 @@ namespace {
 using Node = SyntaxNode;
 
 enum TypeKind { TY_BUILTIN, TY_CLASS, TY_ENUM, TY_CV, TY_POINTER, TY_LREF,
-                TY_RREF, TY_ARRAY, TY_FUNCTION };
+                TY_RREF, TY_ARRAY, TY_FUNCTION, TY_MEMBER_POINTER };
 
 template<class K,class V> class FlatMap {
   struct Slot {
@@ -263,7 +263,8 @@ struct FunctionSignature {
 struct FunctionIdentity {
   SmallIntList parameters;
   bool variadic;
-  FunctionIdentity() : variadic(false) {}
+  bool is_const, is_volatile;
+  FunctionIdentity() : variadic(false), is_const(false), is_volatile(false) {}
 };
 struct ConstValue {
   long long value;
@@ -318,6 +319,7 @@ class Analyzer {
   int global_;
   bool allow_anon_union_;
   unsigned anonymous_union_serial_;
+  bool retain_syntax_;
 
   static void hash_combine(std::size_t &seed,std::size_t value) {
     seed ^= value + static_cast<std::size_t>(0x9e3779b9U) + (seed << 6) + (seed >> 2);
@@ -411,15 +413,20 @@ class Analyzer {
       adjusted.push_back(adjusted_parameter(source_params[i]));
     return adjusted;
   }
-  int intern_function_identity(const std::vector<int> &source_params,bool variadic) {
+  int intern_function_identity(const std::vector<int> &source_params,bool variadic,
+                               bool is_const=false,bool is_volatile=false) {
     FunctionIdentity identity; identity.variadic=variadic;
+    identity.is_const=is_const; identity.is_volatile=is_volatile;
     identity.parameters=adjusted_parameters(source_params);
     std::size_t hash=static_cast<std::size_t>(variadic);
+    hash_combine(hash,static_cast<std::size_t>(is_const));
+    hash_combine(hash,static_cast<std::size_t>(is_volatile));
     for(std::size_t i=0;i<identity.parameters.size();++i)
       hash_combine(hash,static_cast<std::size_t>(identity.parameters[i]+1));
     const int found=function_identity_index_.find(hash,[&](int id) {
       const FunctionIdentity &old=function_identities_[id];
-      return old.variadic==variadic && old.parameters==identity.parameters;
+      return old.variadic==variadic && old.is_const==is_const &&
+             old.is_volatile==is_volatile && old.parameters==identity.parameters;
     });
     if(found>=0)return found;
     const int id=static_cast<int>(function_identities_.size());
@@ -445,11 +452,18 @@ class Analyzer {
     function_signature_index_.insert(hash,id);
     return id;
   }
-  int function_type(int ret,const std::vector<int> &params,bool variadic) {
+  int function_type(int ret,const std::vector<int> &params,bool variadic,
+                    bool is_const=false,bool is_volatile=false) {
     if (ret<0) throw std::runtime_error("invalid function return type");
     Type t; t.kind=TY_FUNCTION; t.base=ret; t.params=params; t.variadic=variadic;
+    t.is_const=is_const; t.is_volatile=is_volatile;
     t.function_signature=intern_function_signature(ret,params,variadic);
-    t.function_identity=intern_function_identity(params,variadic);
+    t.function_identity=intern_function_identity(params,variadic,is_const,is_volatile);
+    return new_type(t);
+  }
+  int member_pointer_type(int base,int owner_scope) {
+    if(base<0||owner_scope<0)throw std::runtime_error("invalid member pointer type");
+    Type t;t.kind=TY_MEMBER_POINTER;t.base=base;t.owner_scope=owner_scope;
     return new_type(t);
   }
   int class_type(int owner,const std::string &tag,const std::string &name) {
@@ -692,32 +706,32 @@ class Analyzer {
   }
   std::pair<int,int> qualified_scope_component(int scope,SemanticNameId name) const {
     bool hidden_ordinary=false;
+    // Search the complete lexical chain for a direct namespace/type binding
+    // before consulting directives at any nearer scope.
     for(int here=scope;here>=0;here=scopes_[here].parent) {
       const int direct=latest_binding(here,name);
-      if(direct>=0) {
-        const Binding &b=binding(here,direct);
-        if(b.kind=="namespace" || b.kind=="namespace-alias")
-          return std::make_pair(here,direct);
-        if(b.kind=="type" || b.kind=="type-alias") {
-          int type=b.type;
-          while(type>=0 && types_[type].kind==TY_CV)type=types_[type].base;
-          if(type>=0 && (types_[type].kind==TY_CLASS || types_[type].kind==TY_ENUM))
-            return std::make_pair(here,direct);
-          return std::make_pair(-1,-1);
-        }
-        hidden_ordinary=true;
+      if(direct<0)continue;
+      const Binding &b=binding(here,direct);
+      if(b.kind=="namespace" || b.kind=="namespace-alias")return std::make_pair(here,direct);
+      if(b.kind=="type" || b.kind=="type-alias") {
+        int type=b.type;
+        while(type>=0 && types_[type].kind==TY_CV)type=types_[type].base;
+        if(type>=0 && (types_[type].kind==TY_CLASS || types_[type].kind==TY_ENUM))return std::make_pair(here,direct);
+        return std::make_pair(-1,-1);
       }
+      hidden_ordinary=true;
+    }
+    for(int here=scope;here>=0;here=scopes_[here].parent) {
       const std::pair<int,int> ns=lookup_direct_or_directive(here,name,false,true);
       if(ns.first>=0)return ns;
-      if(!hidden_ordinary) {
-        const std::pair<int,int> type=lookup_direct_or_directive(here,name,true,false);
-        if(type.first>=0) {
-          int id=binding_type(type.first,type.second);
-          while(id>=0 && types_[id].kind==TY_CV)id=types_[id].base;
-          if(id>=0 && (types_[id].kind==TY_CLASS || types_[id].kind==TY_ENUM))
-            return type;
-          return std::make_pair(-1,-1);
-        }
+    }
+    if(hidden_ordinary)return std::make_pair(-1,-1);
+    for(int here=scope;here>=0;here=scopes_[here].parent) {
+      const std::pair<int,int> type=lookup_direct_or_directive(here,name,true,false);
+      if(type.first>=0) {
+        int id=binding_type(type.first,type.second);
+        while(id>=0 && types_[id].kind==TY_CV)id=types_[id].base;
+        if(id>=0 && (types_[id].kind==TY_CLASS || types_[id].kind==TY_ENUM))return type;
       }
     }
     return std::make_pair(-1,-1);
@@ -819,7 +833,18 @@ class Analyzer {
         r+=type_name(t.params[i]);
       }
       if (t.variadic) { if (!t.params.empty()) r+=", "; r+="..."; }
-      return r+") returning "+type_name(t.base);
+      r+=")";
+      if(t.is_const)r+=" const";
+      if(t.is_volatile)r+=" volatile";
+      return r+" returning "+type_name(t.base);
+    }
+    case TY_MEMBER_POINTER: {
+      std::string owner="<invalid class>";
+      if(t.owner_scope>=0 && scopes_[t.owner_scope].entity_id>=0) {
+        const int type=entities_[scopes_[t.owner_scope].entity_id].canonical_type;
+        if(type>=0)owner=type_name(type);
+      }
+      return "member-pointer of "+owner+" to "+type_name(t.base);
     }
     }
     return "<invalid>";
@@ -932,11 +957,12 @@ class Analyzer {
     return cv_type(result,c,v);
   }
   struct DeclaratorOp {
-    int kind; // 0 pointer, 1 lref, 2 rref, 3 array, 4 function
+    int kind; // 0 pointer, 1 lref, 2 rref, 3 array, 4 function, 5 member pointer
     bool c,v,variadic;
+    int owner_scope;
     unsigned long long bound;
     std::vector<int> params;
-    DeclaratorOp() : kind(0),c(false),v(false),variadic(false),bound(0) {}
+    DeclaratorOp() : kind(0),c(false),v(false),variadic(false),owner_scope(-1),bound(0) {}
   };
   void collect_ops(const Node &d,std::vector<DeclaratorOp> &ops,
                    std::string &name,int scope) {
@@ -949,7 +975,14 @@ class Analyzer {
       if (ch.text.compare(0,12,"ptr-operator")==0) {
         std::string op=ch.text.substr(13);
         DeclaratorOp x;
-        if (op.find("OP_LAND:&&")!=std::string::npos || op.find("OP_AMP:&&")!=std::string::npos || op=="&&") x.kind=2;
+        if(op.size()>=3 && op.compare(op.size()-3,3,"::*")==0) {
+          x.kind=5;
+          std::string owner=op.substr(0,op.size()-3);
+          int owner_type=require_type(scope,owner);
+          while(owner_type>=0&&types_[owner_type].kind==TY_CV)owner_type=types_[owner_type].base;
+          if(owner_type<0||types_[owner_type].kind!=TY_CLASS)throw std::runtime_error("member pointer owner is not a class");
+          x.owner_scope=types_[owner_type].owner_scope;
+        } else if (op.find("OP_LAND:&&")!=std::string::npos || op.find("OP_AMP:&&")!=std::string::npos || op=="&&") x.kind=2;
         else if (op.find("OP_AMP:&")!=std::string::npos || op=="&") x.kind=1;
         else x.kind=0;
         ++i;
@@ -1000,6 +1033,9 @@ class Analyzer {
           op.params.push_back(pt);
         }
         ops.push_back(op);
+      } else if(ch.text.compare(0,std::string("cv-qualifier").size(),"cv-qualifier")==0 && !ops.empty() && ops.back().kind==4) {
+        if(ch.text.find("KW_CONST:const")!=std::string::npos || ch.text.find(" const")!=std::string::npos)ops.back().c=true;
+        if(ch.text.find("KW_VOLATILE:volatile")!=std::string::npos || ch.text.find(" volatile")!=std::string::npos)ops.back().v=true;
       }
     }
     for (std::size_t k=prefix.size();k>0;--k) ops.push_back(prefix[k-1]);
@@ -1013,7 +1049,8 @@ class Analyzer {
       else if (op.kind==1) base=reference_type(base,false);
       else if (op.kind==2) base=reference_type(base,true);
       else if (op.kind==3) base=array_type(base,op.bound);
-      else base=function_type(base,op.params,op.variadic);
+      else if (op.kind==4) base=function_type(base,op.params,op.variadic,op.c,op.v);
+      else base=member_pointer_type(base,op.owner_scope);
     }
     if (out_name) *out_name=name;
     return base;
@@ -1421,6 +1458,35 @@ class Analyzer {
     if(spec.children.empty()) return builtin("int");
     const Node &expr=spec.children[0];
     if(expr.text=="keyword-literal KW_NULLPTR:nullptr")return builtin("nullptr_t");
+    if(expr.text=="sizeof-expression")return builtin("unsigned long int");
+    if(expr.text=="cast-expression" && !expr.children.empty() && expr.children[0].text=="type-id" &&
+       !expr.children[0].children.empty() && !expr.children[0].children[0].children.empty() &&
+       expr.children[0].children[0].children[0].text.compare(0,10,"type-name ")==0) {
+      std::string name=expr.children[0].children[0].children[0].text.substr(10);
+      std::pair<int,int> f=resolve_name(scope,name,false,false);
+      if(f.first>=0) {
+        int type=binding_type(f.first,f.second);while(type>=0&&types_[type].kind==TY_CV)type=types_[type].base;
+        if(type>=0&&types_[type].kind==TY_FUNCTION)return types_[type].base;
+      }
+    }
+    if(expr.text=="call-expression" && !expr.children.empty() &&
+       expr.children[0].text.compare(0,14,"id-expression ")==0) {
+      std::string name=expr.children[0].text.substr(14);
+      std::pair<int,int> f=resolve_name(scope,name,false,false);
+      if(f.first>=0) {
+        const Binding &b=binding(f.first,f.second);
+        int type=b.type;while(type>=0&&types_[type].kind==TY_CV)type=types_[type].base;
+        if(type>=0&&types_[type].kind==TY_FUNCTION)return types_[type].base;
+      }
+    }
+    if(expr.text.compare(0,8,"literal ")==0)return builtin("int");
+    if(expr.text.compare(0,15,"binary-expression")==0) {
+      if(expr.text.find("OP_EQ")!=std::string::npos || expr.text.find("OP_NE")!=std::string::npos ||
+         expr.text.find("OP_LT")!=std::string::npos || expr.text.find("OP_GT")!=std::string::npos ||
+         expr.text.find("OP_LE")!=std::string::npos || expr.text.find("OP_GE")!=std::string::npos ||
+         expr.text.find("OP_LAND")!=std::string::npos || expr.text.find("OP_LOR")!=std::string::npos)return builtin("bool");
+      return builtin("int");
+    }
     if(expr.text.compare(0,14,"id-expression ")==0) {
       std::string name=expr.text.substr(14);
       std::pair<int,int> f=resolve_name(scope,name,false,false);
@@ -1817,6 +1883,11 @@ class Analyzer {
       int target=declaration_target_scope(scope,name,&name);
       if(!is_ancestor_scope(scope,target))throw std::runtime_error("qualified definition in non-enclosing scope");
       const Node *init=0; bool initialized=contains_initializer(item,&init);
+      if(!td && types_[ty].kind==TY_ARRAY && types_[ty].bound==0 && init &&
+         !init->children.empty() && init->children[0].text=="braced-init-list") {
+        const std::size_t count=init->children[0].children.size();
+        if(count)ty=array_type(types_[ty].base,static_cast<unsigned long long>(count));
+      }
       if(!td && types_[ty].kind==TY_ARRAY && types_[ty].bound==0) {
         int name_id=find_name_id(name);
         const BindingIndices *prior=name_id<0?0:scopes_[target].by_name.find(static_cast<std::uint32_t>(name_id));
@@ -2027,6 +2098,18 @@ class Analyzer {
         }
       }
     }
+    if(retain_syntax_ && node.text=="condition-declaration") {
+      const Node *spec=0,*decl=0;
+      for(std::size_t i=0;i<node.children.size();++i) {
+        if(node.children[i].text=="decl-specifier-seq")spec=&node.children[i];
+        else if(node.children[i].text=="declarator")decl=&node.children[i];
+      }
+      if(spec && decl) {
+        std::string name;
+        int ty=derive_declarator(*decl,type_from_specifiers(*spec,scope),scope,&name);
+        if(!name.empty())bind_value(scope,name,"variable",ty,node.location);
+      }
+    }
     if(node.text=="compound-statement") {
       int block=add_scope("block","",scope,true,node.location);
       for(std::size_t i=0;i<node.children.size();++i)
@@ -2039,9 +2122,10 @@ class Analyzer {
     }
     if(node.text=="simple-declaration" || node.text=="class-specifier" ||
        node.text=="enum-specifier" || node.text=="class-forward-declaration" ||
-       node.text=="namespace-definition" || node.text=="namespace-alias-definition" ||
+       node.text.compare(0,std::string("namespace-definition").size(),"namespace-definition")==0 ||
+       node.text.compare(0,std::string("namespace-alias-definition").size(),"namespace-alias-definition")==0 ||
        node.text=="using-declaration" || node.text=="using-directive" ||
-       node.text=="alias-declaration" || node.text=="static-assert-declaration" ||
+       node.text.compare(0,std::string("alias-declaration").size(),"alias-declaration")==0 || node.text=="static-assert-declaration" ||
        node.text=="function-definition" || node.text=="template-declaration") {
       process_declaration(node,scope); return;
     }
@@ -2105,24 +2189,26 @@ class Analyzer {
       if(node.children[i].text=="compound-statement")body=&node.children[i];
     }
     if(!decl) return;
+    int target=scope;std::string simple=tail_name(name);
+    if(name.find("::")!=std::string::npos)target=scope_for_qualified_name(scope,name,&simple);
+    if(!is_ancestor_scope(scope,target))throw std::runtime_error("qualified special member definition in non-enclosing scope");
     std::vector<int> params;
     for(std::size_t i=0;i<decl->children.size();++i)if(decl->children[i].text=="parameter-clause")
       for(std::size_t j=0;j<decl->children[i].children.size();++j)
-        if(decl->children[i].children[j].text=="parameter-declaration")params.push_back(parameter_type(decl->children[i].children[j],scope));
-    std::string simple=tail_name(name);
+        if(decl->children[i].children[j].text=="parameter-declaration")params.push_back(parameter_type(decl->children[i].children[j],target));
     int constructor_type=function_type(builtin("void"),params,false);
-    int old_entity=find_redeclared_entity(scope,simple,"function",constructor_type);
-    int fn=add_binding(scope,simple,"function",constructor_type,-1,old_entity,node.location);
-    int fn_scope=add_scope("function",simple,scope,true,node.location);
-    scopes_[fn_scope].entity_id=scopes_[scope].bindings[fn].entity_id;
+    int old_entity=find_redeclared_entity(target,simple,"function",constructor_type);
+    int fn=add_binding(target,simple,"function",constructor_type,-1,old_entity,node.location);
+    int fn_scope=add_scope("function",simple,target,true,node.location);
+    scopes_[fn_scope].entity_id=scopes_[target].bindings[fn].entity_id;
     for(std::size_t i=0;i<decl->children.size();++i)if(decl->children[i].text=="parameter-clause")
       for(std::size_t j=0;j<decl->children[i].children.size();++j) {
         const Node &p=decl->children[i].children[j];if(p.text!="parameter-declaration")continue;
         const Node *pd=0;for(std::size_t k=0;k<p.children.size();++k)if(p.children[k].text=="declarator"||p.children[k].text=="abstract-declarator")pd=&p.children[k];
         bind_value(fn_scope,pd?declarator_name(*pd):"","parameter",
-                   parameter_type(p,scope),p.location);
+                   parameter_type(p,target),p.location);
       }
-    if(body)process_statement(*body,fn_scope,scope,true);
+    if(body)process_statement(*body,fn_scope,target,true);
   }
   void process_declaration(const Node &node,int scope) {
     const std::string &text=node.text;
@@ -2188,7 +2274,7 @@ class Analyzer {
     }
   }
 public:
-  explicit Analyzer(SyntaxTree &tree) : tree_(tree),lookup_generation_(0),global_(-1),allow_anon_union_(false),anonymous_union_serial_(0) {
+  explicit Analyzer(SyntaxTree &tree, bool retain_syntax) : tree_(tree),lookup_generation_(0),global_(-1),allow_anon_union_(false),anonymous_union_serial_(0),retain_syntax_(retain_syntax) {
     source_line_starts_.resize(tree.source_files.size());
     builtin("void"); builtin("bool"); builtin("char"); builtin("signed char"); builtin("unsigned char");
     builtin("char16_t");builtin("char32_t");builtin("wchar_t");builtin("short int");builtin("unsigned short int");
@@ -2198,7 +2284,8 @@ public:
   }
   void build() {
     process_declaration(tree_.root,global_);
-    release_syntax_tree();
+    if (retain_syntax_) source_files_ = tree_.source_files;
+    else release_syntax_tree();
   }
   void write_dump(std::ostream &out) const {
     out<<"translation-unit\n";
@@ -2243,6 +2330,9 @@ public:
     out.parameter_count=t.params.size();
     return out;
   }
+  int type_from_syntax_node(const Node &node,int scope) {
+    return type_id_type(node,scope);
+  }
   int type_parameter(int id,std::size_t index) const {
     if(id<0 || id>=static_cast<int>(types_.size()) || index>=types_[id].params.size())
       throw std::out_of_range("invalid function type parameter index");
@@ -2273,6 +2363,15 @@ public:
     out.layout_complete=s.layout_complete; out.layout_computed=s.layout_computed;
     out.layout_unsupported=s.layout_unsupported;
     out.layout_empty=s.layout_empty; out.has_vptr=s.layout_has_vptr;
+    return out;
+  }
+  std::vector<SemanticBindingInfo> bindings_named_info(int scope,SemanticNameId name) const {
+    std::vector<SemanticBindingInfo> out;
+    if(scope<0||scope>=static_cast<int>(scopes_.size()))return out;
+    const BindingIndices *indices=scopes_[scope].by_name.find(name);
+    if(!indices)return out;
+    out.reserve(indices->size());
+    for(std::size_t i=0;i<indices->size();++i)out.push_back(binding_info(scope,(*indices)[i]));
     return out;
   }
   SemanticBindingInfo binding_info(int scope,int index) const {
@@ -2338,16 +2437,17 @@ class SemanticModel::Impl {
 public:
   SyntaxTree tree;
   Analyzer analyzer;
-  explicit Impl(SyntaxTree &&input) : tree(std::move(input)),analyzer(tree) {
+  explicit Impl(SyntaxTree &&input, bool retain_syntax) : tree(std::move(input)),analyzer(tree, retain_syntax) {
     analyzer.build();
   }
 };
 
-SemanticModel::SemanticModel(SyntaxTree &&tree) : impl_(new Impl(std::move(tree))) {}
+SemanticModel::SemanticModel(SyntaxTree &&tree, bool retain_syntax) : impl_(new Impl(std::move(tree), retain_syntax)) {}
 SemanticModel::~SemanticModel() {}
-std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree) {
-  return std::unique_ptr<SemanticModel>(new SemanticModel(std::move(tree)));
+std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree, bool retain_syntax) {
+  return std::unique_ptr<SemanticModel>(new SemanticModel(std::move(tree), retain_syntax));
 }
+const SyntaxNode &SemanticModel::syntax_root() const { return impl_->tree.root; }
 std::size_t SemanticModel::type_count() const { return impl_->analyzer.type_count(); }
 std::size_t SemanticModel::source_file_count() const { return impl_->analyzer.source_file_count(); }
 std::size_t SemanticModel::scope_count() const { return impl_->analyzer.scope_count(); }
@@ -2358,6 +2458,9 @@ SemanticNameId SemanticModel::find_name(const std::string &name) const { return 
 const std::string &SemanticModel::name_text(SemanticNameId name) const { return impl_->analyzer.name_by_id(name); }
 const PostTokenSourceFile &SemanticModel::source_file(std::size_t file_id) const { return impl_->analyzer.source_file(file_id); }
 SemanticTypeInfo SemanticModel::type(SemanticTypeId id) const { return impl_->analyzer.type_info(id); }
+SemanticTypeId SemanticModel::type_from_syntax(const SyntaxNode &node,SemanticScopeId scope) {
+  return impl_->analyzer.type_from_syntax_node(node,scope);
+}
 SemanticTypeId SemanticModel::type_parameter(SemanticTypeId id,std::size_t index) const {
   return impl_->analyzer.type_parameter(id,index);
 }
@@ -2365,6 +2468,9 @@ SemanticScopeInfo SemanticModel::scope(SemanticScopeId id) const { return impl_-
 SemanticBindingInfo SemanticModel::binding(SemanticScopeId scope,std::size_t index) const {
   if(index>static_cast<std::size_t>(INT_MAX))throw std::out_of_range("invalid semantic binding index");
   return impl_->analyzer.binding_info(scope,static_cast<int>(index));
+}
+std::vector<SemanticBindingInfo> SemanticModel::bindings_named(SemanticScopeId scope,SemanticNameId name) const {
+  return impl_->analyzer.bindings_named_info(scope,name);
 }
 SemanticEntityInfo SemanticModel::entity(SemanticEntityId id) const { return impl_->analyzer.entity_info(id); }
 SemanticFunctionSignatureInfo SemanticModel::function_signature(SemanticSignatureId id) const { return impl_->analyzer.signature_info(id); }

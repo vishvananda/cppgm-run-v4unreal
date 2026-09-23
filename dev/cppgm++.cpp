@@ -434,8 +434,37 @@ int run_emit_types_mode(const vector<string> &args) {
 }
 
 int run_emit_semantics_mode(const vector<string> &args) {
-  parse_source_output_invocation(args, false);
-  return run_unimplemented_mode("--emit-semantics", "PA7");
+  string outfile;
+  vector<string> inputs;
+  bool explicit_outfile=false;
+  for(size_t i=0;i<args.size();++i) {
+    if(args[i]=="-o") {
+      if(explicit_outfile)throw logic_error("multiple output files provided");
+      consume_required_option_argument(args,i,"-o","output file");
+      outfile=args[i];explicit_outfile=true;
+    } else if(starts_with(args[i],"-")) {
+      throw logic_error("unsupported option in emit mode: "+args[i]);
+    } else inputs.push_back(args[i]);
+  }
+  if(!explicit_outfile||inputs.empty())throw logic_error("invalid usage");
+  ofstream out(outfile.c_str(),ios::binary|ios::trunc);
+  if(!out)throw runtime_error("cannot open output file");
+  out<<inputs.size()<<" translation units\n";
+  for(size_t unit=0;unit<inputs.size();++unit) {
+    PostTokenBuffer records;bool invalid=false;
+    unique_ptr<IPPTokenStream> collector=create_posttoken_collector(records,&invalid);
+    vector<string> one_source(1,inputs[unit]);
+    run_preprocessor_files(one_source,*collector,"\"Jan  1 1970\"","\"00:00:00\"");
+    if(invalid)throw runtime_error("invalid preprocessing token");
+    size_t end=0;while(end<records.size()&&records[end].kind!=PostTokenEof)++end;
+    SyntaxTree tree=parse_syntax_tree(records,0,end,true);
+    out<<"start translation unit "<<(unit+1)<<"\n";
+    unique_ptr<SemanticModel> model=build_semantic_model(std::move(tree),true);
+    write_call_semantics(*model,out);
+    out<<"end translation unit\n";
+  }
+  out.flush();if(!out)throw runtime_error("failed writing output");
+  return EXIT_SUCCESS;
 }
 
 int run_emit_lowir_mode(const vector<string> &args) {
