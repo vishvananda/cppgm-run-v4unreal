@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 using namespace std;
 
@@ -410,16 +411,22 @@ int run_emit_types_mode(const vector<string> &args) {
   if (!out) throw runtime_error("cannot open output file");
   out << inputs.size() << " translation units\n";
   for (size_t unit=0; unit<inputs.size(); ++unit) {
-    PostTokenBuffer records;
-    bool invalid=false;
-    unique_ptr<IPPTokenStream> collector=create_posttoken_collector(records,&invalid);
-    vector<string> one_source(1,inputs[unit]);
-    run_preprocessor_files(one_source,*collector,"\"Jan  1 1970\"","\"00:00:00\"");
-    if(invalid) throw runtime_error("invalid preprocessing token");
-    size_t end=0; while(end<records.size() && records[end].kind!=PostTokenEof)++end;
-    SyntaxTree tree=parse_syntax_tree(records,0,end,true);
+    SyntaxTree tree;
+    {
+      // Token records are an input view for the one parser pass, not retained
+      // transport into semantic construction or dump rendering.
+      PostTokenBuffer records;
+      bool invalid=false;
+      unique_ptr<IPPTokenStream> collector=create_posttoken_collector(records,&invalid);
+      vector<string> one_source(1,inputs[unit]);
+      run_preprocessor_files(one_source,*collector,"\"Jan  1 1970\"","\"00:00:00\"");
+      if(invalid) throw runtime_error("invalid preprocessing token");
+      size_t end=0; while(end<records.size() && records[end].kind!=PostTokenEof)++end;
+      tree=parse_syntax_tree(records,0,end,true);
+    }
     out << "start translation unit " << (unit+1) << "\n";
-    write_semantic_types(tree,out);
+    unique_ptr<SemanticModel> model=build_semantic_model(std::move(tree));
+    write_semantic_types(*model,out);
     out << "end translation unit\n";
   }
   out.flush(); if(!out)throw runtime_error("failed writing output");

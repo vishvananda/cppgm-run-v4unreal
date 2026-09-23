@@ -140,8 +140,8 @@ class Parser {
   }
   bool definite_type_start(std::size_t k = 0) const {
     const std::string x = s(k);
-    if (x == "typename" || x == "class" || x == "struct" || x == "union" ||
-        x == "enum")
+    if (x == "typename" || x == "decltype" || x == "class" || x == "struct" ||
+        x == "union" || x == "enum")
       return true;
     if (syntax_is_keyword(x) &&
         (x == "bool" || x == "char" || x == "char16_t" || x == "char32_t" ||
@@ -968,12 +968,14 @@ class Parser {
       if (x == "class" || x == "struct" || x == "union") {
         const std::size_t class_begin=p_;
         Node c = parse_class_inline(x);
-        bool has_body=false;
-        for(std::size_t q=class_begin;q<p_;++q)if(t_[q].s=="{")has_body=true;
-        if(semantic_mode_ && !has_body && c.text.find("class-specifier ")==0) {
-          Node f=n("class-forward-declaration"+c.text.substr(std::string("class-specifier").size()));
-          if(!c.children.empty())f.add(c.children[0]);
-          c=f;
+        if(semantic_mode_) {
+          bool has_body=false;
+          for(std::size_t q=class_begin;q<p_;++q)if(t_[q].s=="{")has_body=true;
+          if(!has_body && c.text.find("class-specifier ")==0) {
+            Node f=n("class-forward-declaration"+c.text.substr(std::string("class-specifier").size()));
+            if(!c.children.empty())f.add(c.children[0]);
+            c=f;
+          }
         }
         if (have && seq.children.size() &&
             seq.children[0].text.find("KW_FRIEND") != std::string::npos &&
@@ -2509,12 +2511,14 @@ class Parser {
         }
         return cls;
       }
-      bool class_body=false;
-      for(std::size_t q=save;q<p_;++q)if(t_[q].s=="{")class_body=true;
-      if(semantic_mode_ && !class_body && cls.text.find("class-specifier ")==0) {
-        Node f=n("class-forward-declaration"+cls.text.substr(std::string("class-specifier").size()));
-        if(!cls.children.empty())f.add(cls.children[0]);
-        cls=f;
+      if(semantic_mode_) {
+        bool class_body=false;
+        for(std::size_t q=save;q<p_;++q)if(t_[q].s=="{")class_body=true;
+        if(!class_body && cls.text.find("class-specifier ")==0) {
+          Node f=n("class-forward-declaration"+cls.text.substr(std::string("class-specifier").size()));
+          if(!cls.children.empty())f.add(cls.children[0]);
+          cls=f;
+        }
       }
       Node specs = n("decl-specifier-seq");
       specs.add(cls);
@@ -2913,7 +2917,7 @@ public:
         tokens_(input), qualified_types_(tokens_),
         qualified_templates_(tokens_), force_type_names_(0),
         active_template_declarations_(0), semantic_mode_(semantic_mode) {
-    index_braces();
+    if(semantic_mode_)index_braces();
     const std::size_t max_size = static_cast<std::size_t>(-1);
     template_lookahead_budget_ =
         t_.size() > max_size / 4 ? max_size : t_.size() * 4;

@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -75,6 +76,43 @@ public:
 };
 
 
+class FlatIdentityIndex {
+  struct Slot {
+    std::size_t hash;
+    int value;
+    bool occupied;
+    Slot() : hash(0), value(-1), occupied(false) {}
+  };
+  std::vector<Slot> slots_;
+  std::size_t count_;
+  void place(std::size_t hash,int value) {
+    std::size_t i=hash&(slots_.size()-1);
+    while(slots_[i].occupied)i=(i+1)&(slots_.size()-1);
+    slots_[i].hash=hash; slots_[i].value=value; slots_[i].occupied=true; ++count_;
+  }
+  void rehash(std::size_t capacity) {
+    std::vector<Slot> old; old.swap(slots_); slots_.resize(capacity); count_=0;
+    for(std::size_t i=0;i<old.size();++i)
+      if(old[i].occupied)place(old[i].hash,old[i].value);
+  }
+public:
+  FlatIdentityIndex() : count_(0) {}
+  template<class Equal> int find(std::size_t hash,const Equal &equal) const {
+    if(slots_.empty())return -1;
+    std::size_t i=hash&(slots_.size()-1);
+    while(slots_[i].occupied) {
+      if(slots_[i].hash==hash && equal(slots_[i].value))return slots_[i].value;
+      i=(i+1)&(slots_.size()-1);
+    }
+    return -1;
+  }
+  void insert(std::size_t hash,int value) {
+    if(slots_.empty())rehash(16);
+    else if((count_+1)*10>=slots_.size()*7)rehash(slots_.size()*2);
+    place(hash,value);
+  }
+};
+
 struct BindingIndices {
   int first;
   std::vector<int> later;
@@ -123,46 +161,89 @@ public:
   const std::string &text(std::uint32_t id) const { return names_[id]; }
 };
 
+class SmallIntList {
+  static const std::size_t inline_capacity=4;
+  std::size_t size_;
+  int inline_[inline_capacity];
+  std::vector<int> overflow_;
+public:
+  SmallIntList() : size_(0) {}
+  SmallIntList &operator=(const std::vector<int> &values) {
+    size_=0; overflow_.clear();
+    for(std::size_t i=0;i<values.size();++i)push_back(values[i]);
+    return *this;
+  }
+  void push_back(int value) {
+    if(size_<inline_capacity)inline_[size_]=value;
+    else overflow_.push_back(value);
+    ++size_;
+  }
+  std::size_t size() const { return size_; }
+  bool empty() const { return size_==0; }
+  int operator[](std::size_t i) const {
+    return i<inline_capacity?inline_[i]:overflow_[i-inline_capacity];
+  }
+  friend bool operator==(const SmallIntList &a,const SmallIntList &b) {
+    if(a.size_!=b.size_)return false;
+    for(std::size_t i=0;i<a.size_;++i)if(a[i]!=b[i])return false;
+    return true;
+  }
+};
+
 struct Type {
   TypeKind kind;
   int base;
-  std::vector<int> params;
+  SmallIntList params;
   unsigned long long bound;
   bool variadic, is_const, is_volatile, scoped;
   int owner_scope;
   int function_signature;
-  std::string name, key, tag;
+  int function_identity;
+  std::string tag;
+  std::uint32_t name_id;
+  bool template_template;
   Type() : kind(TY_BUILTIN), base(-1), bound(0), variadic(false),
-           is_const(false), is_volatile(false), scoped(false), owner_scope(-1), function_signature(-1) {}
+           is_const(false), is_volatile(false), scoped(false), owner_scope(-1), function_signature(-1),
+           function_identity(-1), name_id(UINT32_MAX), template_template(false) {}
 };
+enum DisplayTypeKind { DISPLAY_DEFAULT, DISPLAY_CLASS, DISPLAY_STRUCT,
+                        DISPLAY_UNION, DISPLAY_ENUM, DISPLAY_ENUM_CLASS };
 struct Binding {
   std::uint32_t name_id;
   std::string kind;
-  std::string display_type;
+  DisplayTypeKind display_kind;
+  std::uint32_t display_name_id;
   int type;
   int target_scope;
   long long value;
   bool has_value;
   int enum_id;
   int function_identity;
+  SyntaxLocation location;
   int entity_id;
   bool is_static;
-  Binding() : name_id(0), type(-1), target_scope(-1), value(0), has_value(false), enum_id(0), function_identity(-1), entity_id(-1), is_static(false) {}
+  Binding() : name_id(0), display_kind(DISPLAY_DEFAULT), display_name_id(UINT32_MAX),
+              type(-1), target_scope(-1), value(0), has_value(false), enum_id(0),
+              function_identity(-1), entity_id(-1), is_static(false) {}
 };
 struct Scope {
-  std::string kind, name;
+  std::string kind;
+  std::uint32_t name_id;
   int parent;
   int entity_id;
+  SyntaxLocation location;
   bool visible, inline_namespace;
-  bool union_class, layout_computed, layout_in_progress, layout_unsupported, layout_complete, has_virtual, has_base;
-  long long object_size, object_alignment;
+  bool union_class, layout_computed, layout_in_progress, layout_unsupported, layout_complete, has_virtual, layout_empty, layout_has_vptr;
+  long long object_size, object_data_size, object_alignment;
+  std::vector<int> base_types;
   std::vector<Binding> bindings;
   FlatMap<std::uint32_t,BindingIndices> by_name;
+  FlatMap<std::uint64_t,int> child_index;
   std::vector<int> children, directives;
-  Scope() : parent(-1), entity_id(-1), visible(true), inline_namespace(false),
+  Scope() : name_id(UINT32_MAX), parent(-1), entity_id(-1), visible(true), inline_namespace(false),
             union_class(false), layout_computed(false), layout_in_progress(false),
-            layout_unsupported(false), layout_complete(false), has_virtual(false), has_base(false),
-            object_size(0), object_alignment(1) {}
+            layout_unsupported(false), layout_complete(false), has_virtual(false),
+            layout_empty(false), layout_has_vptr(false), object_size(0), object_data_size(0), object_alignment(1) {}
 };
 struct Entity {
   std::string kind;
@@ -170,13 +251,19 @@ struct Entity {
   std::uint32_t name_id;
   int canonical_type;
   int function_signature;
+  SyntaxLocation first_location;
   Entity() : owner_scope(-1), name_id(0), canonical_type(-1), function_signature(-1) {}
 };
 struct FunctionSignature {
   int return_type;
-  std::vector<int> parameters;
+  SmallIntList parameters;
   bool variadic;
   FunctionSignature() : return_type(-1), variadic(false) {}
+};
+struct FunctionIdentity {
+  SmallIntList parameters;
+  bool variadic;
+  FunctionIdentity() : variadic(false) {}
 };
 struct ConstValue {
   long long value;
@@ -213,36 +300,69 @@ std::vector<std::string> split_qualified(const std::string &s) {
 }
 
 class Analyzer {
-  const SyntaxTree &tree_;
+  SyntaxTree &tree_;
   std::vector<Type> types_;
   NameInterner names_;
   FlatMap<std::string,int> builtin_;
-  FlatMap<std::string,int> type_index_;
+  FlatIdentityIndex type_index_;
   std::vector<FunctionSignature> function_signatures_;
-  FlatMap<std::string,int> function_signature_index_;
+  FlatIdentityIndex function_signature_index_;
+  std::vector<FunctionIdentity> function_identities_;
+  FlatIdentityIndex function_identity_index_;
   std::vector<Entity> entities_;
   std::vector<Scope> scopes_;
+  std::vector<PostTokenSourceFile> source_files_;
+  mutable std::vector<std::vector<std::size_t> > source_line_starts_;
   mutable std::vector<std::uint64_t> lookup_marks_;
   mutable std::uint64_t lookup_generation_;
   int global_;
   bool allow_anon_union_;
   unsigned anonymous_union_serial_;
 
+  static void hash_combine(std::size_t &seed,std::size_t value) {
+    seed ^= value + static_cast<std::size_t>(0x9e3779b9U) + (seed << 6) + (seed >> 2);
+  }
+  static bool same_type(const Type &a,const Type &b) {
+    return a.kind==b.kind && a.base==b.base && a.params==b.params &&
+           a.bound==b.bound && a.variadic==b.variadic &&
+           a.is_const==b.is_const && a.is_volatile==b.is_volatile &&
+           a.scoped==b.scoped && a.owner_scope==b.owner_scope &&
+           a.name_id==b.name_id && a.template_template==b.template_template;
+  }
+  static std::size_t type_hash(const Type &t) {
+    std::size_t h=static_cast<std::size_t>(t.kind);
+    hash_combine(h,static_cast<std::size_t>(t.base+1));
+    hash_combine(h,static_cast<std::size_t>(t.bound));
+    hash_combine(h,static_cast<std::size_t>(t.variadic));
+    hash_combine(h,static_cast<std::size_t>(t.is_const));
+    hash_combine(h,static_cast<std::size_t>(t.is_volatile));
+    hash_combine(h,static_cast<std::size_t>(t.scoped));
+    hash_combine(h,static_cast<std::size_t>(t.owner_scope+1));
+    hash_combine(h,static_cast<std::size_t>(t.name_id));
+    hash_combine(h,static_cast<std::size_t>(t.template_template));
+    for(std::size_t i=0;i<t.params.size();++i)
+      hash_combine(h,static_cast<std::size_t>(t.params[i]+1));
+    return h;
+  }
   int new_type(const Type &t) {
-    std::ostringstream key;
-    key << static_cast<int>(t.kind) << '/' << t.base << '/' << t.bound << '/'
-        << t.variadic << '/' << t.is_const << '/' << t.is_volatile << '/'
-        << t.owner_scope << '/' << t.name << '/' << t.scoped;
-    for (std::size_t i=0;i<t.params.size();++i) key << '/' << t.params[i];
-    if(const int *f=type_index_.find(key.str()))return *f;
-    Type copy=t; copy.key=key.str();
-    int id=static_cast<int>(types_.size());
-    types_.push_back(copy); type_index_[copy.key]=id; return id;
+    const std::size_t hash=type_hash(t);
+    const int found=type_index_.find(hash,[&](int id) {
+      return same_type(types_[id],t);
+    });
+    if(found>=0)return found;
+    const int id=static_cast<int>(types_.size());
+    types_.push_back(t);
+    type_index_.insert(hash,id);
+    return id;
   }
   int builtin(const std::string &name) {
     if(const int *f=builtin_.find(name))return *f;
-    Type t; t.kind=TY_BUILTIN; t.name=name;
+    Type t; t.kind=TY_BUILTIN; t.name_id=intern_name(name);
     int id=new_type(t); builtin_[name]=id; return id;
+  }
+  bool is_void_type(int id) const {
+    while(id>=0 && types_[id].kind==TY_CV)id=types_[id].base;
+    return id>=0 && types_[id].kind==TY_BUILTIN && name_text(types_[id].name_id)=="void";
   }
   int cv_type(int id, bool c, bool v) {
     if (!c && !v) return id;
@@ -264,6 +384,7 @@ class Analyzer {
   }
   int reference_type(int id, bool rvalue) {
     if (id<0) throw std::runtime_error("invalid reference type");
+    if(is_void_type(id))throw std::runtime_error("reference to void");
     if (types_[id].kind==TY_LREF || types_[id].kind==TY_RREF) {
       bool lvalue = !rvalue || types_[id].kind==TY_LREF;
       Type t; t.kind=lvalue ? TY_LREF : TY_RREF; t.base=types_[id].base;
@@ -273,7 +394,7 @@ class Analyzer {
   }
   int array_type(int id, unsigned long long n) {
     if (id<0 || types_[id].kind==TY_LREF || types_[id].kind==TY_RREF ||
-        (types_[id].kind==TY_BUILTIN && types_[id].name=="void"))
+        types_[id].kind==TY_FUNCTION || is_void_type(id))
       throw std::runtime_error("invalid array element type");
     Type t; t.kind=TY_ARRAY; t.base=id; t.bound=n; return new_type(t);
   }
@@ -284,58 +405,108 @@ class Analyzer {
     if(types_[id].kind==TY_FUNCTION)return pointer_type(id);
     return id;
   }
+  SmallIntList adjusted_parameters(const std::vector<int> &source_params) {
+    SmallIntList adjusted;
+    for(std::size_t i=0;i<source_params.size();++i)
+      adjusted.push_back(adjusted_parameter(source_params[i]));
+    return adjusted;
+  }
+  int intern_function_identity(const std::vector<int> &source_params,bool variadic) {
+    FunctionIdentity identity; identity.variadic=variadic;
+    identity.parameters=adjusted_parameters(source_params);
+    std::size_t hash=static_cast<std::size_t>(variadic);
+    for(std::size_t i=0;i<identity.parameters.size();++i)
+      hash_combine(hash,static_cast<std::size_t>(identity.parameters[i]+1));
+    const int found=function_identity_index_.find(hash,[&](int id) {
+      const FunctionIdentity &old=function_identities_[id];
+      return old.variadic==variadic && old.parameters==identity.parameters;
+    });
+    if(found>=0)return found;
+    const int id=static_cast<int>(function_identities_.size());
+    function_identities_.push_back(identity);
+    function_identity_index_.insert(hash,id);
+    return id;
+  }
   int intern_function_signature(int ret,const std::vector<int> &source_params,bool variadic) {
     FunctionSignature signature; signature.return_type=ret; signature.variadic=variadic;
-    std::ostringstream key; key<<variadic;
-    for(std::size_t i=0;i<source_params.size();++i) {
-      const int adjusted=adjusted_parameter(source_params[i]);
-      signature.parameters.push_back(adjusted); key<<'/'<<adjusted;
-    }
-    if(const int *found=function_signature_index_.find(key.str()))return *found;
+    signature.parameters=adjusted_parameters(source_params);
+    std::size_t hash=static_cast<std::size_t>(variadic);
+    hash_combine(hash,static_cast<std::size_t>(ret+1));
+    for(std::size_t i=0;i<signature.parameters.size();++i)
+      hash_combine(hash,static_cast<std::size_t>(signature.parameters[i]+1));
+    const int found=function_signature_index_.find(hash,[&](int id) {
+      const FunctionSignature &old=function_signatures_[id];
+      return old.return_type==ret && old.variadic==variadic &&
+             old.parameters==signature.parameters;
+    });
+    if(found>=0)return found;
     const int id=static_cast<int>(function_signatures_.size());
-    function_signatures_.push_back(signature);function_signature_index_[key.str()]=id;return id;
+    function_signatures_.push_back(signature);
+    function_signature_index_.insert(hash,id);
+    return id;
   }
   int function_type(int ret,const std::vector<int> &params,bool variadic) {
     if (ret<0) throw std::runtime_error("invalid function return type");
     Type t; t.kind=TY_FUNCTION; t.base=ret; t.params=params; t.variadic=variadic;
     t.function_signature=intern_function_signature(ret,params,variadic);
+    t.function_identity=intern_function_identity(params,variadic);
     return new_type(t);
   }
   int class_type(int owner,const std::string &tag,const std::string &name) {
-    Type t; t.kind=TY_CLASS; t.owner_scope=owner; t.name=name; t.tag=tag;
+    Type t; t.kind=TY_CLASS; t.owner_scope=owner; t.tag=tag;
+    t.name_id=intern_name(name);
     // new_type computes a structural key separately from the display tag.
     return new_type(t);
   }
   int enum_type(int owner,const std::string &name,bool scoped) {
-    Type t; t.kind=TY_ENUM; t.owner_scope=owner; t.name=name; t.scoped=scoped;
+    Type t; t.kind=TY_ENUM; t.owner_scope=owner; t.scoped=scoped;
+    t.name_id=intern_name(name);
     return new_type(t);
   }
+  static std::uint32_t scope_kind_code(const std::string &kind) {
+    if(kind=="namespace")return 1;
+    if(kind=="class")return 2;
+    if(kind=="enum")return 3;
+    if(kind=="function")return 4;
+    if(kind=="template-parameters")return 5;
+    if(kind=="block")return 6;
+    return 0;
+  }
+  static std::uint64_t scope_child_key(std::uint32_t kind,std::uint32_t name) {
+    return (static_cast<std::uint64_t>(kind)<<32)|name;
+  }
   int add_scope(const std::string &kind,const std::string &name,int parent,
-                bool visible=true) {
-    Scope s; s.kind=kind; s.name=name; s.parent=parent; s.visible=visible;
+                bool visible=true,const SyntaxLocation &location=SyntaxLocation()) {
+    Scope s; s.kind=kind; s.parent=parent; s.visible=visible;
+    s.location=location;
+    const std::uint32_t name_id=intern_name(name);
+    s.name_id=name_id;
     int id=static_cast<int>(scopes_.size()); scopes_.push_back(s);
-    if (parent>=0) scopes_[parent].children.push_back(id);
+    if (parent>=0) {
+      scopes_[parent].children.push_back(id);
+      scopes_[parent].child_index[scope_child_key(scope_kind_code(kind),name_id)]=id;
+    }
     return id;
   }
   std::uint32_t intern_name(const std::string &name) { return names_.intern(name); }
   int find_name_id(const std::string &name) const { return names_.find(name); }
   const std::string &name_text(std::uint32_t id) const { return names_.text(id); }
   int add_entity(int scope,std::uint32_t name_id,const std::string &kind,
-                 int type,int signature=-1) {
+                 int type,int signature=-1,
+                 const SyntaxLocation &location=SyntaxLocation()) {
     Entity e; e.owner_scope=scope; e.name_id=name_id; e.kind=kind;
-    e.canonical_type=type; e.function_signature=signature;
+    e.canonical_type=type; e.function_signature=signature; e.first_location=location;
     const int id=static_cast<int>(entities_.size()); entities_.push_back(e); return id;
   }
   int add_binding(int scope,const std::string &name,const std::string &kind,
-                  int type=-1,int target=-1) {
+                  int type=-1,int target=-1,int existing_entity=-1,
+                  const SyntaxLocation &location=SyntaxLocation()) {
     if (scope<0 || scope>=static_cast<int>(scopes_.size()))
       throw std::runtime_error("invalid semantic scope");
     Binding b; b.name_id=intern_name(name); b.kind=kind; b.type=type; b.target_scope=target;
+    b.location=location;
     if(kind=="function" && type>=0 && types_[type].kind==TY_FUNCTION)
-      b.function_identity=types_[type].function_signature;
-    b.entity_id=add_entity(scope,b.name_id,kind,type,b.function_identity);
-    if((kind=="namespace" || kind=="namespace-alias") && target>=0 && scopes_[target].entity_id>=0)
-      b.entity_id=scopes_[target].entity_id;
+      b.function_identity=types_[type].function_identity;
     const BindingIndices *prior=scopes_[scope].by_name.find(b.name_id);
     if(prior) for(std::size_t i=0;i<prior->size();++i) {
       const Binding &old=scopes_[scope].bindings[(*prior)[i]];
@@ -343,12 +514,20 @@ class Analyzer {
       const bool new_ns=kind=="namespace" || kind=="namespace-alias";
       if(old_ns!=new_ns)throw std::runtime_error("namespace conflicts with ordinary name");
     }
+    if(existing_entity>=0)b.entity_id=existing_entity;
+    else if((kind=="namespace" || kind=="namespace-alias") && target>=0 &&
+            scopes_[target].entity_id>=0)b.entity_id=scopes_[target].entity_id;
+    else b.entity_id=add_entity(scope,b.name_id,kind,type,
+                                kind=="function" && type>=0 && types_[type].kind==TY_FUNCTION?
+                                types_[type].function_signature:b.function_identity,location);
     int id=static_cast<int>(scopes_[scope].bindings.size());
     scopes_[scope].bindings.push_back(b); scopes_[scope].by_name[b.name_id].push_back(id);
     return id;
   }
   int bind_value(int scope,const std::string &name,const std::string &kind,
-                 int type) { return add_binding(scope,name,kind,type); }
+                 int type,const SyntaxLocation &location=SyntaxLocation()) {
+    return add_binding(scope,name,kind,type,-1,-1,location);
+  }
   const Node *find_child(const Node &n,const std::string &label) const {
     for (std::size_t i=0;i<n.children.size();++i)
       if (n.children[i].text==label) return &n.children[i];
@@ -392,13 +571,15 @@ class Analyzer {
     while (s>=0 && scopes_[s].parent>=0) s=scopes_[s].parent;
     return s;
   }
-  int latest_binding(int scope,const std::string &name) const {
-    if (scope<0) return -1;
-    int name_id=find_name_id(name);
-    if(name_id<0)return -1;
-    const BindingIndices *f=scopes_[scope].by_name.find(static_cast<std::uint32_t>(name_id));
-    if (!f || f->empty()) return -1;
+  int latest_binding(int scope,SemanticNameId name_id) const {
+    if(scope<0)return -1;
+    const BindingIndices *f=scopes_[scope].by_name.find(name_id);
+    if(!f || f->empty())return -1;
     return f->back();
+  }
+  int latest_binding(int scope,const std::string &name) const {
+    const int id=find_name_id(name);
+    return id<0?-1:latest_binding(scope,static_cast<SemanticNameId>(id));
   }
   const Binding &binding(int scope,int index) const { return scopes_[scope].bindings[index]; }
   int binding_type(int scope,int index) const { return binding(scope,index).type; }
@@ -408,7 +589,8 @@ class Analyzer {
     return -1;
   }
   void add_namespace_binding(int scope,const std::string &name,int child,
-                             const std::string &kind="namespace") {
+                             const std::string &kind="namespace",
+                             const SyntaxLocation &location=SyntaxLocation()) {
     int prev=latest_binding(scope,name);
     if (prev>=0) {
       const Binding &old=binding(scope,prev);
@@ -417,16 +599,16 @@ class Analyzer {
           old.target_scope==child) return;
       throw std::runtime_error("namespace conflicts with existing binding");
     }
-    add_binding(scope,name,kind,-1,child);
+    add_binding(scope,name,kind,-1,child,-1,location);
   }
   int find_child_scope(int scope,const std::string &kind,const std::string &name) const {
-    for (std::size_t i=0;i<scopes_[scope].children.size();++i) {
-      int child=scopes_[scope].children[i];
-      if (scopes_[child].kind==kind && scopes_[child].name==name) return child;
-    }
-    return -1;
+    const int name_id=find_name_id(name);
+    if(scope<0 || name_id<0)return -1;
+    const int *found=scopes_[scope].child_index.find(
+        scope_child_key(scope_kind_code(kind),static_cast<std::uint32_t>(name_id)));
+    return found?*found:-1;
   }
-  std::pair<int,int> lookup_direct_or_directive(int scope,const std::string &name,
+  std::pair<int,int> lookup_direct_or_directive(int scope,SemanticNameId name,
                                                    bool type_only=false,
                                                    bool namespace_only=false) const {
     if(scope<0 || scope>=static_cast<int>(scopes_.size()))return std::make_pair(-1,-1);
@@ -436,6 +618,11 @@ class Analyzer {
       const bool is_type=b.kind=="type" || b.kind=="type-alias";
       const bool is_ns=b.kind=="namespace" || b.kind=="namespace-alias";
       if((!type_only || is_type) && (!namespace_only || is_ns))return std::make_pair(scope,direct);
+      // A declaration of this spelling hides outer ordinary-name bindings;
+      // category-filtered lookup must not fall through to a parent or using edge.
+      if(!namespace_only)return std::make_pair(-1,-1);
+      // Namespace-target lookup uses the namespace-name namespace and may
+      // continue past an ordinary value with the same spelling.
     }
     std::vector<int> work;
     if(lookup_marks_.size()<scopes_.size())lookup_marks_.resize(scopes_.size(),0);
@@ -450,7 +637,7 @@ class Analyzer {
     for(std::size_t i=0;i<root.children.size();++i) {
       const int child=root.children[i];
       if(scopes_[child].kind=="namespace" &&
-         (scopes_[child].inline_namespace || scopes_[child].name=="<unnamed>"))work.push_back(child);
+         (scopes_[child].inline_namespace || name_text(scopes_[child].name_id)=="<unnamed>"))work.push_back(child);
     }
     std::pair<int,int> found(-1,-1);
     for(std::size_t pos=0;pos<work.size();++pos) {
@@ -473,20 +660,98 @@ class Analyzer {
       for(std::size_t i=0;i<scopes_[current].children.size();++i) {
         const int child=scopes_[current].children[i];
         if(scopes_[child].kind=="namespace" &&
-           (scopes_[child].inline_namespace || scopes_[child].name=="<unnamed>"))work.push_back(child);
+           (scopes_[child].inline_namespace || name_text(scopes_[child].name_id)=="<unnamed>"))work.push_back(child);
       }
     }
     return found;
   }
-  std::pair<int,int> unqualified_lookup(int scope,const std::string &name,
+  std::pair<int,int> lookup_direct_or_directive(int scope,const std::string &name,
+                                                   bool type_only=false,
+                                                   bool namespace_only=false) const {
+    const int id=find_name_id(name);
+    return id<0?std::make_pair(-1,-1):
+        lookup_direct_or_directive(scope,static_cast<SemanticNameId>(id),type_only,namespace_only);
+  }
+  std::pair<int,int> unqualified_lookup(int scope,SemanticNameId name,
                                         bool type_only=false,bool namespace_only=false) const {
     int here=scope;
-    while (here>=0) {
+    while(here>=0) {
       std::pair<int,int> result=lookup_direct_or_directive(here,name,type_only,namespace_only);
-      if (result.first>=0) return result;
+      if(result.first>=0)return result;
+      if(type_only && !namespace_only && latest_binding(here,name)>=0)
+        return std::make_pair(-1,-1);
       here=scopes_[here].parent;
     }
     return std::make_pair(-1,-1);
+  }
+  std::pair<int,int> unqualified_lookup(int scope,const std::string &name,
+                                        bool type_only=false,bool namespace_only=false) const {
+    const int id=find_name_id(name);
+    return id<0?std::make_pair(-1,-1):
+        unqualified_lookup(scope,static_cast<SemanticNameId>(id),type_only,namespace_only);
+  }
+  std::pair<int,int> qualified_scope_component(int scope,SemanticNameId name) const {
+    bool hidden_ordinary=false;
+    for(int here=scope;here>=0;here=scopes_[here].parent) {
+      const int direct=latest_binding(here,name);
+      if(direct>=0) {
+        const Binding &b=binding(here,direct);
+        if(b.kind=="namespace" || b.kind=="namespace-alias")
+          return std::make_pair(here,direct);
+        if(b.kind=="type" || b.kind=="type-alias") {
+          int type=b.type;
+          while(type>=0 && types_[type].kind==TY_CV)type=types_[type].base;
+          if(type>=0 && (types_[type].kind==TY_CLASS || types_[type].kind==TY_ENUM))
+            return std::make_pair(here,direct);
+          return std::make_pair(-1,-1);
+        }
+        hidden_ordinary=true;
+      }
+      const std::pair<int,int> ns=lookup_direct_or_directive(here,name,false,true);
+      if(ns.first>=0)return ns;
+      if(!hidden_ordinary) {
+        const std::pair<int,int> type=lookup_direct_or_directive(here,name,true,false);
+        if(type.first>=0) {
+          int id=binding_type(type.first,type.second);
+          while(id>=0 && types_[id].kind==TY_CV)id=types_[id].base;
+          if(id>=0 && (types_[id].kind==TY_CLASS || types_[id].kind==TY_ENUM))
+            return type;
+          return std::make_pair(-1,-1);
+        }
+      }
+    }
+    return std::make_pair(-1,-1);
+  }
+  std::pair<int,int> qualified_scope_component(int scope,const std::string &name) const {
+    const int id=find_name_id(name);
+    return id<0?std::make_pair(-1,-1):
+        qualified_scope_component(scope,static_cast<SemanticNameId>(id));
+  }
+  std::pair<int,int> qualified_lookup_ids(int scope,
+                                          const std::vector<SemanticNameId> &parts,
+                                          bool absolute,bool type_only,
+                                          bool namespace_only) const {
+    if(parts.empty())return std::make_pair(-1,-1);
+    int current=absolute?root_scope(scope):scope;
+    for(std::size_t i=0;i+1<parts.size();++i) {
+      const std::pair<int,int> b=qualified_scope_component(current,parts[i]);
+      if(b.first<0)return std::make_pair(-1,-1);
+      int target=namespace_target(b.first,b.second);
+      if(target<0) {
+        int type=binding_type(b.first,b.second);
+        if(type<0)return std::make_pair(-1,-1);
+        while(types_[type].kind==TY_CV)type=types_[type].base;
+        if(types_[type].kind!=TY_CLASS && types_[type].kind!=TY_ENUM)
+          return std::make_pair(-1,-1);
+        target=types_[type].owner_scope;
+        if(types_[type].kind==TY_ENUM) {
+          const int *definition=enum_definition_lookup_.find(type);
+          if(definition)target=*definition;
+        }
+      }
+      current=target;
+    }
+    return lookup_direct_or_directive(current,parts.back(),type_only,namespace_only);
   }
   std::pair<int,int> qualified_lookup(int scope,const std::string &full,
                                       bool type_only=false,bool namespace_only=false) const {
@@ -495,12 +760,7 @@ class Analyzer {
     int current=scope;
     if (full.compare(0,2,"::")==0) current=root_scope(scope);
     for (std::size_t i=0;i+1<parts.size();++i) {
-      std::pair<int,int> b=unqualified_lookup(current,parts[i],false,true);
-      if (i>0 || b.first<0) b=lookup_direct_or_directive(current,parts[i],false,true);
-      if (b.first<0) {
-        // A class/enum qualifier is a type binding, not a namespace binding.
-        b=lookup_direct_or_directive(current,parts[i],true,false);
-      }
+      std::pair<int,int> b=qualified_scope_component(current,parts[i]);
       if (b.first<0) return std::make_pair(-1,-1);
       int target=namespace_target(b.first,b.second);
       if (target<0) {
@@ -539,9 +799,9 @@ class Analyzer {
     if (id<0) return "<invalid>";
     const Type &t=types_[id];
     switch (t.kind) {
-    case TY_BUILTIN: return t.name;
-    case TY_CLASS: return (t.tag.empty()?"class":t.tag)+" "+t.name;
-    case TY_ENUM: return std::string(t.scoped?"enum class ":"enum ")+t.name;
+    case TY_BUILTIN: return name_text(t.name_id);
+    case TY_CLASS: return (t.tag.empty()?"class":t.tag)+" "+name_text(t.name_id);
+    case TY_ENUM: return std::string(t.scoped?"enum class ":"enum ")+name_text(t.name_id);
     case TY_CV: {
       std::string p;
       if (t.is_const) p="const";
@@ -567,15 +827,27 @@ class Analyzer {
   static std::string number(unsigned long long v) {
     std::ostringstream out; out<<v; return out.str();
   }
+  std::string binding_display_type(const Binding &b) const {
+    const std::uint32_t name_id=b.display_name_id==UINT32_MAX?b.name_id:b.display_name_id;
+    switch(b.display_kind) {
+    case DISPLAY_CLASS:return "class "+name_text(name_id);
+    case DISPLAY_STRUCT:return "struct "+name_text(name_id);
+    case DISPLAY_UNION:return "union "+name_text(name_id);
+    case DISPLAY_ENUM:return "enum "+name_text(name_id);
+    case DISPLAY_ENUM_CLASS:return "enum class "+name_text(name_id);
+    case DISPLAY_DEFAULT:return type_name(b.type);
+    }
+    return type_name(b.type);
+  }
   std::string output_binding(const Binding &b) const {
     if (b.kind=="namespace" || b.kind=="namespace-alias") return std::string();
     if (b.kind=="type" || b.kind=="type-alias")
-      return b.kind+" "+name_text(b.name_id)+" "+(b.display_type.empty()?type_name(b.type):b.display_type);
+      return b.kind+" "+name_text(b.name_id)+" "+binding_display_type(b);
     if (b.kind=="enumerator") {
-      std::ostringstream out; out<<"enumerator "<<name_text(b.name_id)<<" "<<(b.display_type.empty()?type_name(b.type):b.display_type)<<" "<<b.value;
+      std::ostringstream out; out<<"enumerator "<<name_text(b.name_id)<<" "<<binding_display_type(b)<<" "<<b.value;
       return out.str();
     }
-    return b.kind+" "+name_text(b.name_id)+" "+(b.display_type.empty()?type_name(b.type):b.display_type);
+    return b.kind+" "+name_text(b.name_id)+" "+binding_display_type(b);
   }
   int fundamental_type(const std::vector<std::string> &tokens,int scope) {
     bool uns=false, sign=false; int longs=0; bool sh=false, ischar=false;
@@ -626,7 +898,7 @@ class Analyzer {
                  x=="auto" || x=="int" || x=="signed" || x=="unsigned" ||
                  x=="long" || x=="short" || x=="char" || x=="bool" ||
                  x=="char16_t" || x=="char32_t" || x=="wchar_t" ||
-                 x=="float" || x=="double" || x=="void") fundamental.push_back(x);
+                 x=="nullptr_t" || x=="float" || x=="double" || x=="void") fundamental.push_back(x);
         else result=require_type(scope,x);
       } else if (ch.text.compare(0,15,"class-specifier")==0 ||
                  ch.text.compare(0,25,"class-forward-declaration")==0) {
@@ -638,7 +910,7 @@ class Analyzer {
         int owner=analyze_class(ch,scope,n);
         allow_anon_union_=old_anon_union;
         if (n.empty()) n=anonymous_name;
-        if (n.empty()) n=scopes_[owner].name;
+        if (n.empty()) n=name_text(scopes_[owner].name_id);
         result=class_type(owner,class_key(ch),n);
       } else if (ch.text.compare(0,14,"enum-specifier")==0) {
         std::string n=after_prefix(ch.text,"enum-specifier"); n=trim(n);
@@ -792,12 +1064,16 @@ class Analyzer {
     std::string s=after_prefix(n.text,prefix);
     std::size_t p=s.find(':'); return p==std::string::npos?s:s.substr(p+1);
   }
-  ConstValue lookup_constant(int scope,const std::string &name) const {
+  ConstValue lookup_constant(int scope,const std::string &name,
+                             int enum_initializer_context=0) const {
     std::pair<int,int> found=resolve_name(scope,name,false,false);
     if (found.first<0) throw std::runtime_error("unknown value in constant expression: "+name);
     const Binding &b=binding(found.first,found.second);
     if (!b.has_value) throw std::runtime_error("not an integral constant expression");
-    return ConstValue(b.value,b.enum_id);
+    // Within an enumerator initializer, earlier enumerators of this same
+    // enumeration are integral constant values for the initializer rules.
+    const int enum_id=b.enum_id==enum_initializer_context?0:b.enum_id;
+    return ConstValue(b.value,enum_id);
   }
   static bool add_overflow(long long a,long long b,long long &r) {
     if ((b>0 && a>LLONG_MAX-b)||(b<0 && a<LLONG_MIN-b)) return true;
@@ -814,21 +1090,114 @@ class Analyzer {
              : (b>0 ? a<LLONG_MIN/b : a!=0&&b<LLONG_MAX/a)) return true;
     r=a*b;return false;
   }
-  ConstValue eval(const Node &n,int scope) {
+  bool const_integral_value_type(int type) const {
+    while(type>=0 && (types_[type].kind==TY_CV ||
+                      types_[type].kind==TY_LREF || types_[type].kind==TY_RREF))
+      type=types_[type].base;
+    if(type<0)return false;
+    if(types_[type].kind==TY_ENUM)return true;
+    if(types_[type].kind!=TY_BUILTIN)return false;
+    const std::string &name=name_text(types_[type].name_id);
+    return name=="bool" || name=="char" || name=="signed char" ||
+           name=="unsigned char" || name=="wchar_t" || name=="char16_t" ||
+           name=="char32_t" || name=="short int" || name=="unsigned short int" ||
+           name=="int" || name=="unsigned int" || name=="long int" ||
+           name=="unsigned long int" || name=="long long int" ||
+           name=="unsigned long long int";
+  }
+  bool const_qualified_value_type(int type) const {
+    if(type>=0 && (types_[type].kind==TY_LREF || types_[type].kind==TY_RREF))
+      type=types_[type].base;
+    return type>=0 && types_[type].kind==TY_CV && types_[type].is_const;
+  }
+  int scoped_enum_id_of_type(int type) const {
+    while(type>=0 && types_[type].kind==TY_CV)type=types_[type].base;
+    return type>=0 && types_[type].kind==TY_ENUM && types_[type].scoped?
+           types_[type].owner_scope+1:0;
+  }
+  int expression_scoped_enum_id(const Node &n,int scope,
+                                int enum_initializer_context=0) {
+    const std::string &kind=n.text;
+    if(kind.compare(0,8,"literal ")==0 || kind.compare(0,12,"TT_LITERAL:")==0)
+      return 0;
+    if(kind.compare(0,14,"id-expression ")==0) {
+      std::pair<int,int> f=resolve_name(scope,kind.substr(14),false,false);
+      if(f.first<0)throw std::runtime_error("unknown value in constant expression: "+kind.substr(14));
+      const Binding &b=binding(f.first,f.second);
+      if(enum_initializer_context && b.enum_id==enum_initializer_context)return 0;
+      return b.enum_id?b.enum_id:scoped_enum_id_of_type(b.type);
+    }
+    if(kind=="parenthesized-expression" && !n.children.empty())
+      return expression_scoped_enum_id(n.children[0],scope,enum_initializer_context);
+    if(kind.compare(0,22,"sizeof-expression")==0 ||
+       kind.compare(0,22,"type-trait-expression ")==0) {
+      if(!n.children.empty()) {
+        const int type=type_id_type(n.children[0],scope);
+        if(kind.compare(0,22,"sizeof-expression")==0)type_size(type,scope);
+        else type_alignment(type,scope);
+      }
+      return 0;
+    }
+    if(kind.compare(0,15,"cast-expression")==0 && n.children.size()>=2)
+      return scoped_enum_id_of_type(type_id_type(n.children[0],scope));
+    if(kind.compare(0,17,"unary-expression ")==0 && !n.children.empty()) {
+      const int operand=expression_scoped_enum_id(n.children[0],scope,enum_initializer_context);
+      if(operand)throw std::runtime_error("scoped enum requires explicit conversion");
+      return 0;
+    }
+    if(kind.compare(0,18,"binary-expression ")==0 && n.children.size()>=2) {
+      const int lhs=expression_scoped_enum_id(n.children[0],scope,enum_initializer_context);
+      const int rhs=expression_scoped_enum_id(n.children[1],scope,enum_initializer_context);
+      const std::string op=expression_operator(n,"binary-expression ");
+      if(op=="&&" || op=="||") {
+        if(lhs || rhs)throw std::runtime_error("scoped enum is not contextually convertible to bool");
+      } else if(op=="==" || op=="!=") {
+        if((lhs && !rhs)||(!lhs && rhs)||(lhs && rhs && lhs!=rhs))
+          throw std::runtime_error("invalid scoped-enum comparison");
+      } else if(op=="<" || op==">" || op=="<=" || op==">=") {
+        if(lhs || rhs)throw std::runtime_error("invalid scoped-enum comparison");
+      } else if(lhs || rhs) {
+        throw std::runtime_error("scoped enum requires explicit conversion");
+      }
+      return 0;
+    }
+    if(kind.compare(0,22,"conditional-expression")==0 && n.children.size()>=3) {
+      const int condition=expression_scoped_enum_id(n.children[0],scope,enum_initializer_context);
+      if(condition)throw std::runtime_error("scoped enum is not contextually convertible to bool");
+      const int yes=expression_scoped_enum_id(n.children[1],scope,enum_initializer_context);
+      const int no=expression_scoped_enum_id(n.children[2],scope,enum_initializer_context);
+      if(yes && no && yes!=no)throw std::runtime_error("incompatible scoped enum operands");
+      if((yes && !no)||(!yes && no))throw std::runtime_error("scoped enum requires explicit conversion");
+      return yes?yes:no;
+    }
+    return 0;
+  }
+  ConstValue eval(const Node &n,int scope,int enum_initializer_context=0) {
     std::string kind=n.text;
     if (kind.compare(0,8,"literal ")==0 || kind.compare(0,12,"TT_LITERAL:")==0)
       return eval_literal(kind);
     if (kind.compare(0,24,"parenthesized-expression")==0) {
       if (n.children.empty()) return ConstValue();
-      return eval(n.children[0],scope);
+      return eval(n.children[0],scope,enum_initializer_context);
     }
-    if (kind.compare(0,14,"id-expression ")==0) return lookup_constant(scope,kind.substr(14));
+    if (kind.compare(0,14,"id-expression ")==0)
+      return lookup_constant(scope,kind.substr(14),enum_initializer_context);
     if (kind.compare(0,18,"binary-expression ")==0 && n.children.size()>=2) {
       std::string op=expression_operator(n,"binary-expression ");
-      ConstValue a=eval(n.children[0],scope);
-      if (op=="&&" && !a.value) return ConstValue(0);
-      if (op=="||" && a.value) return ConstValue(1);
-      ConstValue b=eval(n.children[1],scope);
+      ConstValue a=eval(n.children[0],scope,enum_initializer_context);
+      if((op=="&&" || op=="||") && a.enum_id)
+        throw std::runtime_error("scoped enum is not contextually convertible to bool");
+      if (op=="&&" && !a.value) {
+        if(expression_scoped_enum_id(n.children[1],scope,enum_initializer_context))
+          throw std::runtime_error("scoped enum is not contextually convertible to bool");
+        return ConstValue(0);
+      }
+      if (op=="||" && a.value) {
+        if(expression_scoped_enum_id(n.children[1],scope,enum_initializer_context))
+          throw std::runtime_error("scoped enum is not contextually convertible to bool");
+        return ConstValue(1);
+      }
+      ConstValue b=eval(n.children[1],scope,enum_initializer_context);
       if ((op=="==" || op=="!=" || op=="<" || op==">" || op=="<=" || op==">=") &&
           ((a.enum_id && !b.enum_id)||(b.enum_id && !a.enum_id)||(a.enum_id && b.enum_id && a.enum_id!=b.enum_id)))
         throw std::runtime_error("invalid scoped-enum comparison");
@@ -858,7 +1227,8 @@ class Analyzer {
       throw std::runtime_error("unsupported constant operator");
     }
     if (kind.compare(0,17,"unary-expression ")==0 && !n.children.empty()) {
-      std::string op=expression_operator(n,"unary-expression "); ConstValue a=eval(n.children[0],scope);
+      std::string op=expression_operator(n,"unary-expression ");
+      ConstValue a=eval(n.children[0],scope,enum_initializer_context);
       if(a.enum_id)throw std::runtime_error("scoped enum requires explicit conversion");
       if(op=="+")return a;
       if(op=="-") { if(a.value==LLONG_MIN)throw std::runtime_error("constant overflow"); return ConstValue(-a.value); }
@@ -866,9 +1236,9 @@ class Analyzer {
       if(op=="~")return ConstValue(~a.value);
     }
     if (kind.compare(0,22,"conditional-expression")==0 && n.children.size()>=3) {
-      ConstValue c=eval(n.children[0],scope);
+      ConstValue c=eval(n.children[0],scope,enum_initializer_context);
       if(c.enum_id)throw std::runtime_error("scoped enum is not contextually convertible to bool");
-      return eval(n.children[c.value?1:2],scope);
+      return eval(n.children[c.value?1:2],scope,enum_initializer_context);
     }
     if (kind.compare(0,17,"sizeof-expression")==0 || kind.compare(0,22,"type-trait-expression ")==0) {
       if(n.children.empty()) return ConstValue();
@@ -877,7 +1247,8 @@ class Analyzer {
       return ConstValue(alignment?type_alignment(t,scope):type_size(t,scope));
     }
     if (kind.compare(0,15,"cast-expression")==0 && n.children.size()>=2) {
-      int t=type_id_type(n.children[0],scope); ConstValue v=eval(n.children.back(),scope);
+      int t=type_id_type(n.children[0],scope);
+      ConstValue v=eval(n.children.back(),scope,enum_initializer_context);
       if(types_[t].kind==TY_ENUM && types_[t].scoped) return ConstValue(v.value,types_[t].owner_scope+1);
       return ConstValue(v.value);
     }
@@ -893,16 +1264,52 @@ class Analyzer {
   void complete_class_layout(int scope) {
     Scope &s=scopes_[scope];
     if(s.layout_computed)return;
-    if(!s.visible || !s.layout_complete || s.layout_in_progress || s.layout_unsupported || s.has_base)
+    if(!s.visible || !s.layout_complete || s.layout_in_progress || s.layout_unsupported)
       throw std::runtime_error("class layout is incomplete or unsupported");
     s.layout_in_progress=true;
     long long offset=0, max_align=1, max_size=0;
-    if(s.has_virtual) { offset=8; max_align=8; max_size=8; }
+    bool inherited_vptr=false, empty_bases=true, has_data=false;
+    for(std::size_t i=0;i<s.base_types.size();++i) {
+      int base=s.base_types[i];
+      while(types_[base].kind==TY_CV)base=types_[base].base;
+      if(types_[base].kind!=TY_CLASS)throw std::runtime_error("invalid base class type");
+      const int base_scope=types_[base].owner_scope;
+      complete_class_layout(base_scope);
+      const Scope &bs=scopes_[base_scope];
+      empty_bases=empty_bases && bs.layout_empty;
+      inherited_vptr=inherited_vptr || bs.layout_has_vptr;
+      max_align=std::max(max_align,bs.object_alignment);
+      // Empty base optimization and reuse of base tail padding follow the
+      // target C++ ABI; nonempty bases retain their source declaration order.
+      if(!bs.layout_empty) {
+        offset=round_up(offset,bs.object_alignment);
+        if(bs.object_data_size>LLONG_MAX-offset)throw std::runtime_error("object layout overflow");
+        offset+=bs.object_data_size;
+      }
+    }
+    if(s.has_virtual && !inherited_vptr) {
+      // A class with virtual functions but no primary virtual base owns its
+      // vptr at offset zero on the target x86-64 C++ ABI.
+      if(offset==0)offset=8;
+      else offset=round_up(offset,8)+8;
+      max_align=std::max<long long>(max_align,8);
+    }
+    FlatMap<int,bool> laid_out_entities;
     for(std::size_t i=0;i<s.bindings.size();++i) {
       const Binding &b=s.bindings[i];
-      if(b.kind!="variable" || b.is_static)continue;
-      const long long size=type_size(b.type,scope);
-      const long long align=type_alignment(b.type,scope);
+      if(b.kind!="variable")continue;
+      if(b.entity_id>=0) {
+        if(laid_out_entities.find(b.entity_id))continue;
+        laid_out_entities[b.entity_id]=true;
+      }
+      if(b.is_static)continue;
+      has_data=true;
+      // On the target x86-64 ABI a reference data member occupies a pointer
+      // slot, even though sizeof(reference-type) reports the referent size.
+      const bool reference_member=b.type>=0 &&
+          (types_[b.type].kind==TY_LREF || types_[b.type].kind==TY_RREF);
+      const long long size=reference_member?8:type_size(b.type,scope);
+      const long long align=reference_member?8:type_alignment(b.type,scope);
       if(s.union_class) max_size=std::max(max_size,size);
       else {
         offset=round_up(offset,align);
@@ -912,8 +1319,11 @@ class Analyzer {
       max_align=std::max(max_align,align);
     }
     if(s.union_class)offset=max_size;
+    s.layout_has_vptr=s.has_virtual || inherited_vptr;
+    s.layout_empty=!s.union_class && !has_data && !s.layout_has_vptr && empty_bases;
     if(offset==0)offset=1;
     s.object_alignment=max_align;
+    s.object_data_size=offset;
     s.object_size=round_up(offset,max_align);
     s.layout_in_progress=false;
     s.layout_computed=true;
@@ -939,12 +1349,13 @@ class Analyzer {
       return scopes_[t.owner_scope].object_size;
     }
     if(t.kind==TY_FUNCTION)throw std::runtime_error("sizeof function");
-    const std::string &n=t.name;
+    const std::string &n=name_text(t.name_id);
     if(n=="char"||n=="signed char"||n=="unsigned char"||n=="bool"||n=="char8_t")return 1;
     if(n=="char16_t"||n=="short int"||n=="unsigned short int")return 2;
     if(n=="char32_t"||n=="wchar_t"||n=="int"||n=="unsigned int"||n=="float")return 4;
     if(n=="long int"||n=="unsigned long int"||n=="long long int"||n=="unsigned long long int"||n=="double")return 8;
     if(n=="long double")return 16;
+    if(n=="nullptr_t")return 8;
     throw std::runtime_error("unknown type size");
   }
   long long type_alignment(int type,int scope) {
@@ -963,12 +1374,13 @@ class Analyzer {
       return scopes_[t.owner_scope].object_alignment;
     }
     if(t.kind==TY_FUNCTION)throw std::runtime_error("alignof function");
-    const std::string &n=t.name;
+    const std::string &n=name_text(t.name_id);
     if(n=="char"||n=="signed char"||n=="unsigned char"||n=="bool"||n=="char8_t")return 1;
     if(n=="char16_t"||n=="short int"||n=="unsigned short int")return 2;
     if(n=="char32_t"||n=="wchar_t"||n=="int"||n=="unsigned int"||n=="float")return 4;
     if(n=="long int"||n=="unsigned long int"||n=="long long int"||n=="unsigned long long int"||n=="double")return 8;
     if(n=="long double")return 16;
+    if(n=="nullptr_t")return 8;
     throw std::runtime_error("unknown type alignment");
   }
   int type_id_type(const Node &node,int scope) {
@@ -981,6 +1393,8 @@ class Analyzer {
       for(std::size_t i=0;i<seq->children.size();++i) {
         std::string text=seq->children[i].text;
         if(text.compare(0,14,"type-specifier")==0) text="decl-specifier"+text.substr(14);
+        else if(text.compare(0,18,"decltype-specifier")==0)
+          text="decl-specifier"+text.substr(18);
         Node item(text); for(std::size_t j=0;j<seq->children[i].children.size();++j)item.children.push_back(seq->children[i].children[j]);
         fake.children.push_back(item);
       }
@@ -994,6 +1408,8 @@ class Analyzer {
       for(std::size_t i=0;i<node.children.size();++i) {
         std::string text=node.children[i].text;
         if(text.compare(0,14,"type-specifier")==0) text="decl-specifier"+text.substr(14);
+        else if(text.compare(0,18,"decltype-specifier")==0)
+          text="decl-specifier"+text.substr(18);
         Node item(text); for(std::size_t j=0;j<node.children[i].children.size();++j)item.children.push_back(node.children[i].children[j]);
         fake.children.push_back(item);
       }
@@ -1004,6 +1420,7 @@ class Analyzer {
   int decltype_type(const Node &spec,int scope) {
     if(spec.children.empty()) return builtin("int");
     const Node &expr=spec.children[0];
+    if(expr.text=="keyword-literal KW_NULLPTR:nullptr")return builtin("nullptr_t");
     if(expr.text.compare(0,14,"id-expression ")==0) {
       std::string name=expr.text.substr(14);
       std::pair<int,int> f=resolve_name(scope,name,false,false);
@@ -1033,13 +1450,7 @@ class Analyzer {
     int current=scope;
     if(qualified.compare(0,2,"::")==0) current=root_scope(scope);
     for(std::size_t i=0;i<parts.size();++i) {
-      std::pair<int,int> f;
-      if(i==0) f=unqualified_lookup(current,parts[i],false,true);
-      else f=lookup_direct_or_directive(current,parts[i],false,true);
-      if(f.first<0) {
-        if(i==0) f=unqualified_lookup(current,parts[i],true,false);
-        else f=lookup_direct_or_directive(current,parts[i],true,false);
-      }
+      std::pair<int,int> f=qualified_scope_component(current,parts[i]);
       if(f.first<0) throw std::runtime_error("unknown qualified scope: "+parts[i]);
       int target=namespace_target(f.first,f.second);
       if(target<0) {
@@ -1060,23 +1471,42 @@ class Analyzer {
     return false;
   }
   int ensure_named_type_scope(int parent,const std::string &kind,
-                              const std::string &name,bool visible) {
+                              const std::string &name,bool visible,
+                              const SyntaxLocation &location=SyntaxLocation()) {
     int found=find_child_scope(parent,kind,name);
     if(found>=0) { if(visible) scopes_[found].visible=true; return found; }
-    const int id=add_scope(kind,name,parent,visible);
-    scopes_[id].entity_id=add_entity(parent,intern_name(name),kind,-1);
+    const int id=add_scope(kind,name,parent,visible,location);
+    scopes_[id].entity_id=add_entity(parent,intern_name(name),kind,-1,-1,location);
     return id;
   }
   std::string source_point_name(const Node &n,const std::string &prefix) const {
-    unsigned long line=1,col=1;
-    if(n.location.valid() && n.location.file_id()<tree_.source_files.size()) {
-      const std::shared_ptr<const std::string> src=tree_.source_files[n.location.file_id()].contents;
-      std::size_t off=n.location.source_offset();
-      if(src) for(std::size_t i=0;i<off && i<src->size();++i) {
-        if((*src)[i]=='\n'){++line;col=1;}else ++col;
+    std::size_t line=1,column=1;
+    const std::uint32_t file=n.location.valid()?n.location.file_id():0;
+    if(n.location.valid() && file<tree_.source_files.size()) {
+      const std::shared_ptr<const std::string> source=tree_.source_files[file].contents;
+      const std::size_t offset=n.location.source_offset();
+      if(source) {
+        std::vector<std::size_t> &starts=source_line_starts_[file];
+        if(starts.empty()) {
+          starts.push_back(0);
+          for(std::size_t i=0;i<source->size();++i)
+            if((*source)[i]=='\n')starts.push_back(i+1);
+        }
+        std::vector<std::size_t>::const_iterator after=
+            std::upper_bound(starts.begin(),starts.end(),offset);
+        const std::size_t index=after==starts.begin()?0:
+            static_cast<std::size_t>((after-starts.begin())-1);
+        line=index+1;
+        column=offset-starts[index]+1;
       }
     }
-    std::ostringstream out; out<<prefix<<line<<"_"<<col; return out.str();
+    std::ostringstream out;
+    out<<prefix;
+    // Preserve legacy names for the main source while disambiguating anonymous
+    // types whose identical line/column occurs in a separately included file.
+    if(file)out<<"f"<<(file+1)<<"_";
+    out<<line<<"_"<<column;
+    return out.str();
   }
   int analyze_class(const Node &node,int scope,const std::string &forced_name="") {
     std::string full_name;
@@ -1095,24 +1525,73 @@ class Analyzer {
     }
     std::string name=tail_name(full_name);
     int owner=scope;
+    const bool is_forward=node.text.compare(0,25,"class-forward-declaration")==0;
     if(full_name.find("::")!=std::string::npos)
       owner=scope_for_qualified_name(scope,full_name);
-    bool is_forward=node.text.compare(0,25,"class-forward-declaration")==0;
+    else if(is_forward) {
+      // Elaborated class lookup can find a class-name hidden by an ordinary
+      // declaration; search lexical scopes for the class entity, not the
+      // latest value binding with the same spelling.
+      const int tag_name_id=find_name_id(name);
+      bool found_tag=false;
+      for(int here=scope;here>=0 && !found_tag;here=scopes_[here].parent) {
+        if(tag_name_id<0)break;
+        const BindingIndices *candidates=scopes_[here].by_name.find(
+            static_cast<std::uint32_t>(tag_name_id));
+        if(!candidates)continue;
+        for(std::size_t i=candidates->size();i>0;--i) {
+          const Binding &candidate=scopes_[here].bindings[(*candidates)[i-1]];
+          if(candidate.kind!="type" || candidate.type<0)continue;
+          int candidate_type=candidate.type;
+          while(types_[candidate_type].kind==TY_CV)candidate_type=types_[candidate_type].base;
+          if(types_[candidate_type].kind==TY_CLASS) {
+            const int class_scope=types_[candidate_type].owner_scope;
+            if(class_scope>=0)owner=scopes_[class_scope].parent;
+            found_tag=true;
+            break;
+          }
+        }
+      }
+    }
     bool definition=node.text.compare(0,15,"class-specifier")==0 && !is_forward;
     if(!definition && !is_forward)
       throw std::runtime_error("invalid class declaration");
     if(anonymous && key=="union" && scopes_[scope].kind=="namespace" && !allow_anon_union_)
       throw std::runtime_error("namespace-scope anonymous union requires static");
-    int cls=ensure_named_type_scope(owner,"class",name,definition);
+    int cls=ensure_named_type_scope(owner,"class",name,definition,node.location);
     scopes_[cls].union_class=(key=="union");
     for(std::size_t i=0;i<node.children.size();++i) {
-      if(node.children[i].text=="base-clause" && !node.children[i].children.empty())scopes_[cls].has_base=true;
-      if(node.children[i].text=="bit-field-declaration")scopes_[cls].layout_unsupported=true;
-      if(node.children[i].text=="function-definition" || node.children[i].text.compare(0,24,"special-member-definition")==0)
-        for(std::size_t j=0;j<node.children[i].children.size();++j)
-          if(node.children[i].children[j].text=="member-specifiers")
-            for(std::size_t k=0;k<node.children[i].children[j].children.size();++k)
-              if(node.children[i].children[j].children[k].text.find("virtual")!=std::string::npos)scopes_[cls].has_virtual=true;
+      if(node.children[i].text=="bit-field-declaration")
+        scopes_[cls].layout_unsupported=true;
+      if(node.children[i].text=="base-clause") {
+        for(std::size_t j=0;j<node.children[i].children.size();++j) {
+          const Node &base=node.children[i].children[j];
+          if(base.text!="base-specifier")continue;
+          std::string base_name;
+          bool virtual_base=false;
+          for(std::size_t k=0;k<base.children.size();++k) {
+            if(base.children[k].text.compare(0,10,"base-name ")==0)
+              base_name=trim(base.children[k].text.substr(10));
+            if(base.children[k].text.find("virtual")!=std::string::npos)
+              virtual_base=true;
+          }
+          if(virtual_base)scopes_[cls].layout_unsupported=true;
+          if(!base_name.empty()) {
+            int base_type=require_type(owner,base_name);
+            while(types_[base_type].kind==TY_CV)base_type=types_[base_type].base;
+            if(types_[base_type].kind!=TY_CLASS)
+              throw std::runtime_error("base specifier does not name a class");
+            scopes_[cls].base_types.push_back(base_type);
+          }
+        }
+      }
+      const Node &declaration=node.children[i];
+      for(std::size_t j=0;j<declaration.children.size();++j) {
+        const Node &child=declaration.children[j];
+        if(child.text!="decl-specifier-seq")continue;
+        for(std::size_t k=0;k<child.children.size();++k)
+          if(specifier_value(child.children[k])=="virtual")scopes_[cls].has_virtual=true;
+      }
     }
     int ty=class_type(cls,key,name);
     bool has_type=false;
@@ -1124,9 +1603,10 @@ class Analyzer {
     }
     bool emit_type=!anonymous && (definition || !has_type);
     if(emit_type) {
-      int type_binding=add_binding(owner,name,"type",ty);
-      scopes_[owner].bindings[type_binding].display_type=key+" "+name;
-      scopes_[owner].bindings[type_binding].entity_id=scopes_[cls].entity_id;
+      int type_binding=add_binding(owner,name,"type",ty,-1,scopes_[cls].entity_id,node.location);
+      Binding &display=scopes_[owner].bindings[type_binding];
+      display.display_name_id=display.name_id;
+      display.display_kind=key=="class"?DISPLAY_CLASS:key=="struct"?DISPLAY_STRUCT:DISPLAY_UNION;
     }
     if(!definition) return cls;
 
@@ -1148,7 +1628,8 @@ class Analyzer {
       for(std::size_t i=0;i<scopes_[cls].bindings.size();++i) {
         const Binding &member=scopes_[cls].bindings[i];
         if(member.kind=="variable" || member.kind=="function" || member.kind=="enumerator") {
-          int injected=add_binding(scope,name_text(member.name_id),member.kind,member.type);
+          int injected=add_binding(scope,name_text(member.name_id),member.kind,
+                                   member.type,-1,member.entity_id,member.location);
           scopes_[scope].bindings[injected].value=member.value;
           scopes_[scope].bindings[injected].has_value=member.has_value;
           scopes_[scope].bindings[injected].enum_id=member.enum_id;
@@ -1187,21 +1668,22 @@ class Analyzer {
     if(enum_scope<0) {
       std::string scope_name=qualified?full_name:name;
       int output_parent=qualified?root_scope(scope):owner;
-      enum_scope=ensure_named_type_scope(output_parent,"enum",scope_name,scoped);
+      enum_scope=ensure_named_type_scope(output_parent,"enum",scope_name,scoped,node.location);
       ty=enum_type(enum_scope,scope_name,scoped);
     } else if(scoped) scopes_[enum_scope].visible=true;
     if(opaque && !scoped) throw std::runtime_error("opaque unscoped enum not supported");
     if(!qualified) {
-      int type_binding=add_binding(owner,name,"type",ty);
-      scopes_[owner].bindings[type_binding].entity_id=scopes_[enum_scope].entity_id;
+      add_binding(owner,name,"type",ty,-1,scopes_[enum_scope].entity_id,node.location);
     }
     int enumerator_scope=enum_scope;
     if(qualified && body) {
-      enumerator_scope=ensure_named_type_scope(root_scope(scope),"enum",full_name,true);
+      enumerator_scope=ensure_named_type_scope(root_scope(scope),"enum",full_name,true,node.location);
       enum_definition_lookup_[ty]=enumerator_scope;
-      int root_type=add_binding(root_scope(scope),full_name,"type",ty);
-      scopes_[root_scope(scope)].bindings[root_type].display_type=std::string(scoped?"enum class ":"enum ")+full_name;
-      scopes_[root_scope(scope)].bindings[root_type].entity_id=scopes_[enum_scope].entity_id;
+      int root_type=add_binding(root_scope(scope),full_name,"type",ty,-1,
+                                scopes_[enum_scope].entity_id,node.location);
+      Binding &display=scopes_[root_scope(scope)].bindings[root_type];
+      display.display_name_id=intern_name(full_name);
+      display.display_kind=scoped?DISPLAY_ENUM_CLASS:DISPLAY_ENUM;
     }
     int underlying=-1;
     for(std::size_t i=0;i<node.children.size();++i) {
@@ -1221,15 +1703,19 @@ class Analyzer {
       std::string en=e.text.substr(11);
       long long value=next;
       if(!e.children.empty()) {
-        ConstValue v=eval(e.children[0],scope);
+        ConstValue v=eval(e.children[0],scoped?enumerator_scope:owner,
+                          scoped?enum_scope+1:0);
         if(!v.valid)throw std::runtime_error("invalid enumerator initializer");
         value=v.value;
       }
       int target=scoped?enumerator_scope:owner;
-      int bid=add_binding(target,en,"enumerator",ty);
+      int bid=add_binding(target,en,"enumerator",ty,-1,-1,e.location);
       Binding &b=scopes_[target].bindings[bid]; b.value=value; b.has_value=true;
       b.enum_id=scoped?enum_scope+1:0;
-      if(qualified && scoped) b.display_type="enum class "+full_name;
+      if(qualified && scoped) {
+        b.display_name_id=intern_name(full_name);
+        b.display_kind=DISPLAY_ENUM_CLASS;
+      }
       if(value==LLONG_MAX && i+1<node.children.size())throw std::runtime_error("enumerator overflow");
       next=value+1;
     }
@@ -1264,7 +1750,7 @@ class Analyzer {
       const Binding &old=scopes_[scope].bindings[(*f)[i]];
       if(old.kind!=kind)continue;
       if(kind=="function") {
-        if(type<0 || types_[type].kind!=TY_FUNCTION || old.function_identity!=types_[type].function_signature)continue;
+        if(type<0 || types_[type].kind!=TY_FUNCTION || old.function_identity!=types_[type].function_identity)continue;
         if(old.type<0 || types_[old.type].base!=types_[type].base)
           throw std::runtime_error("incompatible function return type");
         return old.entity_id;
@@ -1340,29 +1826,43 @@ class Analyzer {
              types_[old.type].bound>0) { ty=old.type; break; }
         }
       }
-      if(!td && types_[ty].kind==TY_BUILTIN && types_[ty].name=="void")
+      if(!td && is_void_type(ty))
         throw std::runtime_error("object has void type");
       if(!td && (types_[ty].kind==TY_LREF || types_[ty].kind==TY_RREF) &&
          !initialized && !ext && scopes_[target].kind!="class")
         throw std::runtime_error("reference requires initializer");
-      if(td) add_binding(target,name,"type-alias",ty);
+      if(td) add_binding(target,name,"type-alias",ty,-1,-1,item.location);
       else if(types_[ty].kind==TY_FUNCTION) {
         int old_entity=find_redeclared_entity(target,name,"function",ty);
-        int id=add_binding(target,name,"function",ty);
-        if(old_entity>=0)scopes_[target].bindings[id].entity_id=old_entity;
+        add_binding(target,name,"function",ty,-1,old_entity,item.location);
       } else {
         if(types_[ty].kind==TY_ARRAY)complete_prior_arrays(target,name,ty);
         int old_entity=find_redeclared_entity(target,name,"variable",ty);
-        int id=add_binding(target,name,"variable",ty);
-        if(old_entity>=0)scopes_[target].bindings[id].entity_id=old_entity;
+        int id=add_binding(target,name,"variable",ty,-1,old_entity,item.location);
         Binding &b=scopes_[target].bindings[id];
         b.is_static=has_spec(*spec,"static");
         if(initialized && init) {
           const Node *value=initializer_value(*init);
+          if(value && value->text=="braced-init-list" && value->children.size()==1)
+            value=&value->children[0];
           if(value) {
-            try { ConstValue c=eval(*value,scope); if(c.valid && (has_spec(*spec,"const")||has_spec(*spec,"constexpr")) &&
-                       (types_[ty].kind!=TY_POINTER)) { b.value=c.value;b.has_value=true;b.enum_id=c.enum_id; } }
-            catch(const std::exception &) { /* Non-constant initializers remain ordinary variables. */ }
+            const int value_enum=expression_scoped_enum_id(*value,scope);
+            const int target_enum=scoped_enum_id_of_type(ty);
+            if((value_enum || target_enum) && value_enum!=target_enum)
+              throw std::runtime_error("invalid implicit scoped-enum conversion");
+            ConstValue c;
+            try { c=eval(*value,scope); }
+            catch(const std::exception &) {
+              // A constexpr declaration requires a constant initializer;
+              // ordinary const objects may have non-constant initialization.
+              if(has_spec(*spec,"constexpr"))throw;
+            }
+            if(has_spec(*spec,"constexpr") && !c.valid)
+              throw std::runtime_error("constexpr initializer is not a constant expression");
+            if(c.valid && const_integral_value_type(ty) &&
+               (const_qualified_value_type(ty) || has_spec(*spec,"constexpr"))) {
+              b.value=c.value; b.has_value=true; b.enum_id=c.enum_id;
+            }
           }
         }
         if(types_[ty].kind==TY_ARRAY) complete_prior_arrays(target,name,ty);
@@ -1374,7 +1874,7 @@ class Analyzer {
     if(name.empty())throw std::runtime_error("invalid alias declaration");
     if(node.children.empty())throw std::runtime_error("alias type expected");
     int ty=type_id_type(node.children[0],scope);
-    add_binding(scope,name,"type-alias",ty);
+    add_binding(scope,name,"type-alias",ty,-1,-1,node.location);
   }
   void process_using_declaration(const Node &node,int scope) {
     if(node.children.empty())throw std::runtime_error("using target expected");
@@ -1397,7 +1897,8 @@ class Analyzer {
     if(from<0)throw std::runtime_error("using declaration target not found");
     const Binding source=binding(target,from);
     if(source.kind=="namespace" || source.kind=="namespace-alias")throw std::runtime_error("using target is not declaration");
-    add_binding(scope,tail,source.kind,source.type,source.target_scope);
+    add_binding(scope,tail,source.kind,source.type,source.target_scope,
+                source.entity_id,node.location);
     int imported=static_cast<int>(scopes_[scope].bindings.size()-1);
     scopes_[scope].bindings[imported].value=source.value;
     scopes_[scope].bindings[imported].has_value=source.has_value;
@@ -1414,10 +1915,10 @@ class Analyzer {
     if(child<0) {
       int old=latest_binding(scope,text);
       if(old>=0 && binding(scope,old).kind=="namespace-alias")throw std::runtime_error("cannot reopen namespace alias");
-      child=add_scope("namespace",text,scope);
+      child=add_scope("namespace",text,scope,true,node.location);
       scopes_[child].inline_namespace=inl;
-      scopes_[child].entity_id=add_entity(scope,intern_name(text),"namespace",-1);
-      add_namespace_binding(scope,text,child);
+      scopes_[child].entity_id=add_entity(scope,intern_name(text),"namespace",-1,-1,node.location);
+      add_namespace_binding(scope,text,child,"namespace",node.location);
     } else scopes_[child].inline_namespace=scopes_[child].inline_namespace||inl;
     for(std::size_t i=0;i<node.children.size();++i)
       if(node.children[i].text!="inline")process_declaration(node.children[i],child);
@@ -1434,7 +1935,7 @@ class Analyzer {
       if(b.kind=="namespace-alias" && b.target_scope==target)return;
       throw std::runtime_error("namespace alias conflicts with binding");
     }
-    add_binding(scope,name,"namespace-alias",-1,target);
+    add_binding(scope,name,"namespace-alias",-1,target,-1,node.location);
   }
   void process_using_directive(const Node &node,int scope) {
     if(node.children.empty())return;
@@ -1472,9 +1973,8 @@ class Analyzer {
     while(type>=0 && types_[type].kind==TY_CV)type=types_[type].base;
     if(type<0 || types_[type].kind!=TY_FUNCTION)throw std::runtime_error("function definition declarator is not a function");
     int old_entity=find_redeclared_entity(target,name,"function",type);
-    int function_binding=add_binding(target,name,"function",type);
-    if(old_entity>=0)scopes_[target].bindings[function_binding].entity_id=old_entity;
-    int fn_scope=add_scope("function",name,target);
+    int function_binding=add_binding(target,name,"function",type,-1,old_entity,node.location);
+    int fn_scope=add_scope("function",name,target,true,node.location);
     scopes_[fn_scope].entity_id=scopes_[target].bindings[function_binding].entity_id;
     for(std::size_t i=0;i<decl->children.size();++i) {
       const Node &clause=decl->children[i]; if(clause.text!="parameter-clause")continue;
@@ -1486,7 +1986,7 @@ class Analyzer {
           if(param.children[k].text=="declarator" || param.children[k].text=="abstract-declarator")pdecl=&param.children[k];
         if(pdecl)pname=declarator_name(*pdecl);
         int pt=parameter_type(param,target);
-        bind_value(fn_scope,pname,"parameter",pt);
+        add_binding(fn_scope,pname,"parameter",pt,-1,-1,param.location);
       }
     }
     if(body) {
@@ -1528,7 +2028,7 @@ class Analyzer {
       }
     }
     if(node.text=="compound-statement") {
-      int block=add_scope("block","",scope);
+      int block=add_scope("block","",scope,true,node.location);
       for(std::size_t i=0;i<node.children.size();++i)
         process_statement(node.children[i],block,block,false);
       return;
@@ -1564,10 +2064,11 @@ class Analyzer {
         if(ch.text=="template-template-parameter")template_template=true;
       }
       if(name.empty()) return;
-      Type t; t.kind=TY_BUILTIN;
-      t.name=template_template?"template-parameter "+name:"typename "+name;
+      Type t; t.kind=TY_BUILTIN; t.owner_scope=scope;
+      t.template_template=template_template;
+      t.name_id=intern_name(template_template?"template-parameter "+name:"typename "+name);
       int ty=new_type(t);
-      add_binding(scope,name,"type",ty);
+      add_binding(scope,name,"type",ty,-1,-1,node.location);
       return;
     }
     if(node.text=="non-type-template-parameter") {
@@ -1578,12 +2079,12 @@ class Analyzer {
         int t=-1;
         for(std::size_t i=0;i<node.children.size();++i)
           if(node.children[i].text=="decl-specifier-seq")t=type_from_specifiers(node.children[i],scope);
-        bind_value(scope,name,"variable",t);
+        bind_value(scope,name,"variable",t,node.location);
       }
     }
   }
   void process_template(const Node &node,int scope) {
-    int params=add_scope("template-parameters","",scope);
+    int params=add_scope("template-parameters","",scope,true,node.location);
     if(node.children.empty())return;
     const Node &clause=node.children[0];
     for(std::size_t i=0;i<clause.children.size();++i) {
@@ -1611,15 +2112,15 @@ class Analyzer {
     std::string simple=tail_name(name);
     int constructor_type=function_type(builtin("void"),params,false);
     int old_entity=find_redeclared_entity(scope,simple,"function",constructor_type);
-    int fn=add_binding(scope,simple,"function",constructor_type);
-    if(old_entity>=0)scopes_[scope].bindings[fn].entity_id=old_entity;
-    int fn_scope=add_scope("function",simple,scope);
+    int fn=add_binding(scope,simple,"function",constructor_type,-1,old_entity,node.location);
+    int fn_scope=add_scope("function",simple,scope,true,node.location);
     scopes_[fn_scope].entity_id=scopes_[scope].bindings[fn].entity_id;
     for(std::size_t i=0;i<decl->children.size();++i)if(decl->children[i].text=="parameter-clause")
       for(std::size_t j=0;j<decl->children[i].children.size();++j) {
         const Node &p=decl->children[i].children[j];if(p.text!="parameter-declaration")continue;
         const Node *pd=0;for(std::size_t k=0;k<p.children.size();++k)if(p.children[k].text=="declarator"||p.children[k].text=="abstract-declarator")pd=&p.children[k];
-        bind_value(fn_scope,pd?declarator_name(*pd):"","parameter",parameter_type(p,scope));
+        bind_value(fn_scope,pd?declarator_name(*pd):"","parameter",
+                   parameter_type(p,scope),p.location);
       }
     if(body)process_statement(*body,fn_scope,scope,true);
   }
@@ -1654,12 +2155,22 @@ class Analyzer {
       }
     }
   }
+  void release_syntax_tree() {
+    typedef std::vector<Node,SyntaxArenaAllocator<Node> > NodeVector;
+    {
+      NodeVector discarded((SyntaxArenaAllocator<Node>(tree_.arena.get())));
+      tree_.root.children.swap(discarded);
+    }
+    source_files_.swap(tree_.source_files);
+    tree_.arena.reset();
+  }
   void render_scope(int id,std::ostream &out,unsigned depth) const {
     const Scope &s=scopes_[id];
     if(!s.visible)return;
     for(unsigned i=0;i<depth;++i)out<<"  ";
     out<<"scope "<<s.kind;
-    if(!s.name.empty())out<<" "<<s.name;
+    if(s.name_id!=UINT32_MAX && !name_text(s.name_id).empty())
+      out<<" "<<name_text(s.name_id);
     out<<'\n';
     for(std::size_t i=0;i<s.bindings.size();++i) {
       std::string line=output_binding(s.bindings[i]);
@@ -1677,21 +2188,209 @@ class Analyzer {
     }
   }
 public:
-  explicit Analyzer(const SyntaxTree &tree) : tree_(tree),lookup_generation_(0),global_(-1),allow_anon_union_(false),anonymous_union_serial_(0) {
+  explicit Analyzer(SyntaxTree &tree) : tree_(tree),lookup_generation_(0),global_(-1),allow_anon_union_(false),anonymous_union_serial_(0) {
+    source_line_starts_.resize(tree.source_files.size());
     builtin("void"); builtin("bool"); builtin("char"); builtin("signed char"); builtin("unsigned char");
     builtin("char16_t");builtin("char32_t");builtin("wchar_t");builtin("short int");builtin("unsigned short int");
     builtin("int");builtin("unsigned int");builtin("long int");builtin("unsigned long int");builtin("long long int");
     builtin("unsigned long long int");builtin("float");builtin("double");builtin("long double");builtin("nullptr_t");
     global_=add_scope("namespace","<global>",-1);
   }
-  void run(std::ostream &out) {
+  void build() {
     process_declaration(tree_.root,global_);
+    release_syntax_tree();
+  }
+  void write_dump(std::ostream &out) const {
     out<<"translation-unit\n";
     render_scope(global_,out,1);
+  }
+  std::size_t type_count() const { return types_.size(); }
+  std::size_t scope_count() const { return scopes_.size(); }
+  std::size_t entity_count() const { return entities_.size(); }
+  std::size_t signature_count() const { return function_signatures_.size(); }
+  std::size_t identity_count() const { return function_identities_.size(); }
+  std::size_t source_file_count() const { return source_files_.size(); }
+  SemanticNameId find_name_by_text(const std::string &text) const {
+    const int id=find_name_id(text);
+    return id<0?UINT32_MAX:static_cast<SemanticNameId>(id);
+  }
+  const std::string &name_by_id(SemanticNameId id) const { return name_text(id); }
+  const PostTokenSourceFile &source_file(std::size_t id) const { return source_files_.at(id); }
+  std::pair<int,int> lookup_unqualified_id(int scope,SemanticNameId name,
+                                           bool type_only,bool namespace_only) const {
+    return unqualified_lookup(scope,name,type_only,namespace_only);
+  }
+  std::pair<int,int> lookup_qualified_ids(int scope,
+                                          const std::vector<SemanticNameId> &path,
+                                          bool absolute,bool type_only,
+                                          bool namespace_only) const {
+    return qualified_lookup_ids(scope,path,absolute,type_only,namespace_only);
+  }
+  SemanticTypeInfo type_info(int id) const {
+    if(id<0 || id>=static_cast<int>(types_.size()))throw std::out_of_range("invalid semantic type ID");
+    const Type &t=types_[id]; SemanticTypeInfo out;
+    out.kind=static_cast<SemanticTypeKind>(t.kind); out.base=t.base; out.array_bound=t.bound;
+    out.variadic=t.variadic; out.is_const=t.is_const; out.is_volatile=t.is_volatile;
+    out.scoped=t.scoped; out.template_template=t.template_template;
+    out.owner_scope=t.owner_scope; out.enum_underlying_type=-1;
+    if(t.kind==TY_ENUM) {
+      const int *underlying=enum_underlying_.find(t.owner_scope);
+      if(underlying)out.enum_underlying_type=*underlying;
+    }
+    out.function_signature=t.function_signature;
+    out.function_identity=t.function_identity; out.name=t.name_id;
+    out.class_tag=t.tag=="class"?1:t.tag=="struct"?2:t.tag=="union"?3:0;
+    out.parameter_count=t.params.size();
+    return out;
+  }
+  int type_parameter(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(types_.size()) || index>=types_[id].params.size())
+      throw std::out_of_range("invalid function type parameter index");
+    return types_[id].params[index];
+  }
+  int signature_parameter(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(function_signatures_.size()) ||
+       index>=function_signatures_[id].parameters.size())
+      throw std::out_of_range("invalid function signature parameter index");
+    return function_signatures_[id].parameters[index];
+  }
+  int identity_parameter(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(function_identities_.size()) ||
+       index>=function_identities_[id].parameters.size())
+      throw std::out_of_range("invalid function identity parameter index");
+    return function_identities_[id].parameters[index];
+  }
+  SemanticScopeInfo scope_info(int id) const {
+    if(id<0 || id>=static_cast<int>(scopes_.size()))throw std::out_of_range("invalid semantic scope ID");
+    const Scope &s=scopes_[id]; SemanticScopeInfo out;
+    out.kind=static_cast<SemanticScopeKind>(scope_kind_code(s.kind));
+    out.name=s.name_id; out.parent=s.parent;
+    out.entity=s.entity_id; out.visible=s.visible; out.inline_namespace=s.inline_namespace;
+    out.union_class=s.union_class; out.location=s.location;
+    out.binding_count=s.bindings.size(); out.child_count=s.children.size();
+    out.directive_count=s.directives.size(); out.base_count=s.base_types.size();
+    out.object_size=s.object_size; out.object_alignment=s.object_alignment;
+    out.layout_complete=s.layout_complete; out.layout_computed=s.layout_computed;
+    out.layout_unsupported=s.layout_unsupported;
+    out.layout_empty=s.layout_empty; out.has_vptr=s.layout_has_vptr;
+    return out;
+  }
+  SemanticBindingInfo binding_info(int scope,int index) const {
+    if(scope<0 || scope>=static_cast<int>(scopes_.size()) || index<0 ||
+       index>=static_cast<int>(scopes_[scope].bindings.size()))
+      throw std::out_of_range("invalid semantic binding index");
+    const Binding &b=scopes_[scope].bindings[index]; SemanticBindingInfo out;
+    out.kind=static_cast<SemanticBindingKind>(
+        b.kind=="type"?1:b.kind=="type-alias"?2:b.kind=="enumerator"?3:
+        b.kind=="function"?4:b.kind=="variable"?5:b.kind=="parameter"?6:
+        b.kind=="namespace"?7:b.kind=="namespace-alias"?8:0);
+    out.name=b.name_id; out.type=b.type; out.target_scope=b.target_scope;
+    out.entity=b.entity_id; out.function_identity=b.function_identity;
+    out.constant_value=b.value; out.has_constant=b.has_value; out.is_static=b.is_static;
+    out.enum_identity=b.enum_id;
+    out.display_kind=static_cast<SemanticDisplayTypeKind>(b.display_kind);
+    out.display_name=b.display_name_id; out.location=b.location;
+    return out;
+  }
+  SemanticEntityInfo entity_info(int id) const {
+    if(id<0 || id>=static_cast<int>(entities_.size()))throw std::out_of_range("invalid semantic entity ID");
+    const Entity &e=entities_[id]; SemanticEntityInfo out;
+    out.kind=static_cast<SemanticEntityKind>(
+        e.kind=="namespace"?1:e.kind=="class"?2:e.kind=="enum"?3:
+        e.kind=="function"?4:e.kind=="variable"?5:e.kind=="type"?6:0);
+    out.name=e.name_id; out.owner_scope=e.owner_scope; out.canonical_type=e.canonical_type;
+    out.function_signature=e.function_signature; out.first_location=e.first_location;
+    return out;
+  }
+  SemanticFunctionSignatureInfo signature_info(int id) const {
+    if(id<0 || id>=static_cast<int>(function_signatures_.size()))throw std::out_of_range("invalid semantic signature ID");
+    const FunctionSignature &sig=function_signatures_[id]; SemanticFunctionSignatureInfo out;
+    out.return_type=sig.return_type; out.variadic=sig.variadic;
+    out.parameter_count=sig.parameters.size();
+    return out;
+  }
+  SemanticFunctionIdentityInfo identity_info(int id) const {
+    if(id<0 || id>=static_cast<int>(function_identities_.size()))throw std::out_of_range("invalid function identity ID");
+    const FunctionIdentity &identity=function_identities_[id]; SemanticFunctionIdentityInfo out;
+    out.variadic=identity.variadic;
+    out.parameter_count=identity.parameters.size();
+    return out;
+  }
+  int scope_child(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(scopes_.size()) || index>=scopes_[id].children.size())
+      throw std::out_of_range("invalid semantic child-scope index");
+    return scopes_[id].children[index];
+  }
+  int scope_directive(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(scopes_.size()) || index>=scopes_[id].directives.size())
+      throw std::out_of_range("invalid namespace directive index");
+    return scopes_[id].directives[index];
+  }
+  int scope_base(int id,std::size_t index) const {
+    if(id<0 || id>=static_cast<int>(scopes_.size()) || index>=scopes_[id].base_types.size())
+      throw std::out_of_range("invalid base-class index");
+    return scopes_[id].base_types[index];
   }
 };
 } // namespace
 
-void write_semantic_types(const SyntaxTree &tree,std::ostream &output) {
-  Analyzer analyzer(tree); analyzer.run(output);
+class SemanticModel::Impl {
+public:
+  SyntaxTree tree;
+  Analyzer analyzer;
+  explicit Impl(SyntaxTree &&input) : tree(std::move(input)),analyzer(tree) {
+    analyzer.build();
+  }
+};
+
+SemanticModel::SemanticModel(SyntaxTree &&tree) : impl_(new Impl(std::move(tree))) {}
+SemanticModel::~SemanticModel() {}
+std::unique_ptr<SemanticModel> build_semantic_model(SyntaxTree &&tree) {
+  return std::unique_ptr<SemanticModel>(new SemanticModel(std::move(tree)));
+}
+std::size_t SemanticModel::type_count() const { return impl_->analyzer.type_count(); }
+std::size_t SemanticModel::source_file_count() const { return impl_->analyzer.source_file_count(); }
+std::size_t SemanticModel::scope_count() const { return impl_->analyzer.scope_count(); }
+std::size_t SemanticModel::entity_count() const { return impl_->analyzer.entity_count(); }
+std::size_t SemanticModel::function_signature_count() const { return impl_->analyzer.signature_count(); }
+std::size_t SemanticModel::function_identity_count() const { return impl_->analyzer.identity_count(); }
+SemanticNameId SemanticModel::find_name(const std::string &name) const { return impl_->analyzer.find_name_by_text(name); }
+const std::string &SemanticModel::name_text(SemanticNameId name) const { return impl_->analyzer.name_by_id(name); }
+const PostTokenSourceFile &SemanticModel::source_file(std::size_t file_id) const { return impl_->analyzer.source_file(file_id); }
+SemanticTypeInfo SemanticModel::type(SemanticTypeId id) const { return impl_->analyzer.type_info(id); }
+SemanticTypeId SemanticModel::type_parameter(SemanticTypeId id,std::size_t index) const {
+  return impl_->analyzer.type_parameter(id,index);
+}
+SemanticScopeInfo SemanticModel::scope(SemanticScopeId id) const { return impl_->analyzer.scope_info(id); }
+SemanticBindingInfo SemanticModel::binding(SemanticScopeId scope,std::size_t index) const {
+  if(index>static_cast<std::size_t>(INT_MAX))throw std::out_of_range("invalid semantic binding index");
+  return impl_->analyzer.binding_info(scope,static_cast<int>(index));
+}
+SemanticEntityInfo SemanticModel::entity(SemanticEntityId id) const { return impl_->analyzer.entity_info(id); }
+SemanticFunctionSignatureInfo SemanticModel::function_signature(SemanticSignatureId id) const { return impl_->analyzer.signature_info(id); }
+SemanticTypeId SemanticModel::signature_parameter(SemanticSignatureId id,std::size_t index) const {
+  return impl_->analyzer.signature_parameter(id,index);
+}
+SemanticFunctionIdentityInfo SemanticModel::function_identity(SemanticFunctionIdentityId id) const { return impl_->analyzer.identity_info(id); }
+SemanticTypeId SemanticModel::identity_parameter(SemanticFunctionIdentityId id,std::size_t index) const {
+  return impl_->analyzer.identity_parameter(id,index);
+}
+SemanticScopeId SemanticModel::scope_child(SemanticScopeId id,std::size_t index) const { return impl_->analyzer.scope_child(id,index); }
+SemanticScopeId SemanticModel::scope_directive(SemanticScopeId id,std::size_t index) const { return impl_->analyzer.scope_directive(id,index); }
+SemanticTypeId SemanticModel::scope_base(SemanticScopeId id,std::size_t index) const { return impl_->analyzer.scope_base(id,index); }
+SemanticLookupResult SemanticModel::lookup_unqualified(SemanticScopeId scope,SemanticNameId name,
+                                                         bool type_only,bool namespace_only) const {
+  const std::pair<int,int> result=impl_->analyzer.lookup_unqualified_id(scope,name,type_only,namespace_only);
+  SemanticLookupResult out; out.scope=result.first; out.binding_index=result.second; return out;
+}
+SemanticLookupResult SemanticModel::lookup_qualified(SemanticScopeId scope,
+                                                      const std::vector<SemanticNameId> &path,
+                                                      bool absolute,bool type_only,
+                                                      bool namespace_only) const {
+  const std::pair<int,int> result=impl_->analyzer.lookup_qualified_ids(
+      scope,path,absolute,type_only,namespace_only);
+  SemanticLookupResult out; out.scope=result.first; out.binding_index=result.second; return out;
+}
+void write_semantic_types(const SemanticModel &model,std::ostream &output) {
+  model.impl_->analyzer.write_dump(output);
 }
