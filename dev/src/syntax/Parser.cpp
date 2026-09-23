@@ -35,6 +35,8 @@ class Parser {
   std::vector<std::string> class_names_;
   unsigned force_type_names_;
   unsigned active_template_declarations_;
+  bool semantic_mode_;
+  std::vector<std::size_t> brace_mate_;
   Tok tok(std::size_t k = 0) const {
     static const std::string eof_spelling("<eof>");
     return p_ + k < t_.size() ? t_[p_ + k]
@@ -158,7 +160,12 @@ class Parser {
         std::size_t j = k + 2;
         while (j + 1 < t_.size() && t_[j + 1].s == "::")
           j += 2;
-        return qualified_types_.count(s(j)) || category_is_type(s(j));
+        if (qualified_types_.count(s(j)) || category_is_type(s(j))) return true;
+        // Leave the final type/value distinction to PA6 semantic lookup. A
+        // following declarator token makes this a type-shaped qualified-id.
+        if(!semantic_mode_)return false;
+        const std::string &next=s(j+1);
+        return identifier(j+1) || next=="*" || next=="&" || next=="&&" || next=="(";
       }
       return category_is_type(x);
     }
@@ -179,6 +186,17 @@ class Parser {
     if (identifier(k))
       return s(k + 1) == "::" ? definite_type_start(k) : category_is_type(x);
     return false;
+  }
+  void index_braces() {
+    brace_mate_.assign(t_.size(),t_.size());
+    std::vector<std::size_t> stack;
+    for(std::size_t i=0;i<t_.size();++i) {
+      if(t_[i].s=="{") stack.push_back(i);
+      else if(t_[i].s=="}" && !stack.empty()) {
+        const std::size_t open=stack.back(); stack.pop_back();
+        brace_mate_[open]=i; brace_mate_[i]=open;
+      }
+    }
   }
   void push_scope() {
     types_.push_back(FlatNameSet(tokens_));
@@ -659,7 +677,7 @@ class Parser {
         need("]");
         d.add(a);
       } else {
-        if (s(1) != ")" && !type_start(1))
+        if (s(1) != ")" && !(semantic_mode_ && s(1) == "...") && !type_start(1))
           break;
         std::size_t parameter_start = p_;
         try {
@@ -830,17 +848,21 @@ class Parser {
       any = true;
     }
     if (at("(")) {
-      if (s(1) == ")" || type_start(1) || force_type_names_) {
-        a.add(parse_parameter_clause());
-        any = true;
+      if (semantic_mode_) {
+        if (s(1) == ")" || s(1) == "..." || type_start(1)) {
+          a.add(parse_parameter_clause());
+          any = true;
+        } else {
+          ++p_;
+          Node nested = parse_abstract_declarator();
+          need(")");
+          Node nd = n("nested-declarator"); nd.add(nested); a.add(nd); any = true;
+        }
+      } else if (s(1) == ")" || type_start(1) || force_type_names_) {
+        a.add(parse_parameter_clause()); any = true;
       } else {
-        ++p_;
-        Node nested = parse_declarator(true);
-        need(")");
-        Node nd = n("nested-declarator");
-        nd.add(nested);
-        a.add(nd);
-        any = true;
+        ++p_; Node nested=parse_declarator(true); need(")");
+        Node nd=n("nested-declarator"); nd.add(nested); a.add(nd); any=true;
       }
     }
     while (at("[") || at("(")) {
@@ -944,7 +966,15 @@ class Parser {
         continue;
       }
       if (x == "class" || x == "struct" || x == "union") {
+        const std::size_t class_begin=p_;
         Node c = parse_class_inline(x);
+        bool has_body=false;
+        for(std::size_t q=class_begin;q<p_;++q)if(t_[q].s=="{")has_body=true;
+        if(semantic_mode_ && !has_body && c.text.find("class-specifier ")==0) {
+          Node f=n("class-forward-declaration"+c.text.substr(std::string("class-specifier").size()));
+          if(!c.children.empty())f.add(c.children[0]);
+          c=f;
+        }
         if (have && seq.children.size() &&
             seq.children[0].text.find("KW_FRIEND") != std::string::npos &&
             !c.children.empty()) {
@@ -998,7 +1028,7 @@ class Parser {
         base_seen = true;
         continue;
       }
-      if (x == "typename" || type_start()) {
+      if (x == "typename" || type_start() || (semantic_mode_ && identifier() && s(1) == "::")) {
         if (identifier() && base_seen && !(s(1) == "::" && s(2) == "*"))
           break;
         if (identifier() &&
@@ -1799,8 +1829,8 @@ class Parser {
       e.add(n("enum-key " + label_token(x)));
     }
     std::string name;
-    if (identifier())
-      name = identifier_text();
+    if (identifier() || (semantic_mode_ && at("::")))
+      name = semantic_mode_ ? parse_name() : identifier_text();
     if (!name.empty())
       declare_type(name);
     if (take(":")) { // underlying enum type is retained as type syntax
@@ -2189,19 +2219,32 @@ class Parser {
       }
       class_names_.push_back(name);
       push_scope();
-      {
-        int depth = 0;
-        for (std::size_t k = p_; k < t_.size(); ++k) {
-          if (t_[k].s == "{")
-            ++depth;
-          else if (t_[k].s == "}") {
-            if (depth == 0)
-              break;
-            --depth;
-          } else if ((t_[k].s == "class" || t_[k].s == "struct" ||
-                      t_[k].s == "union") &&
-                     k + 1 < t_.size() && t_[k + 1].kind == PostTokenIdentifier)
-            types_.back().insert(t_[k + 1].s);
+      if(semantic_mode_) {
+        for(std::size_t k=p_;k<t_.size();++k) {
+          if(t_[k].s=="}")break;
+          if(t_[k].s=="typedef") {
+            for(std::size_t z=k+1;z<t_.size()&&t_[z].s!=";";++z) {
+              if(t_[z].s=="{" && z<brace_mate_.size() && brace_mate_[z]<t_.size()) { z=brace_mate_[z]; continue; }
+              if(t_[z].kind==PostTokenIdentifier)types_.back().insert(t_[z].s);
+            }
+          }
+          if(t_[k].s=="using" && k+2<t_.size() && t_[k+2].s=="=")
+            types_.back().insert(t_[k+1].s);
+          if((t_[k].s=="class" || t_[k].s=="struct" || t_[k].s=="union" || t_[k].s=="enum") &&
+             k+1<t_.size() && t_[k+1].kind==PostTokenIdentifier)
+            types_.back().insert(t_[k+1].s);
+          if(t_[k].s=="{" && k<brace_mate_.size() && brace_mate_[k]<t_.size()) {
+            k=brace_mate_[k];
+          }
+        }
+      } else {
+        int depth=0;
+        for(std::size_t k=p_;k<t_.size();++k) {
+          if(t_[k].s=="{")++depth;
+          else if(t_[k].s=="}") { if(depth==0)break; --depth; }
+          else if((t_[k].s=="class" || t_[k].s=="struct" || t_[k].s=="union") &&
+                  k+1<t_.size() && t_[k+1].kind==PostTokenIdentifier)
+            types_.back().insert(t_[k+1].s);
         }
       }
       while (!eof() && !at("}")) {
@@ -2466,6 +2509,13 @@ class Parser {
         }
         return cls;
       }
+      bool class_body=false;
+      for(std::size_t q=save;q<p_;++q)if(t_[q].s=="{")class_body=true;
+      if(semantic_mode_ && !class_body && cls.text.find("class-specifier ")==0) {
+        Node f=n("class-forward-declaration"+cls.text.substr(std::string("class-specifier").size()));
+        if(!cls.children.empty())f.add(cls.children[0]);
+        cls=f;
+      }
       Node specs = n("decl-specifier-seq");
       specs.add(cls);
       Node simple = n("simple-declaration");
@@ -2483,8 +2533,8 @@ class Parser {
         e.add(n("enum-key " + label_token(k)));
       }
       std::string nm;
-      if (identifier())
-        nm = identifier_text();
+      if (identifier() || (semantic_mode_ && at("::")))
+        nm = semantic_mode_ ? parse_name() : identifier_text();
       if (take(":")) {
         Node u = n("type-id");
         u.add(parse_type_specifier_seq(false));
@@ -2560,6 +2610,18 @@ class Parser {
     bind_function_parameters(declarator);
     return parse_compound();
   }
+  bool declarator_denotes_function(const Node &d) const {
+    const Node *nested=0;
+    bool function_suffix=false, pointer_prefix=false;
+    for(std::size_t i=0;i<d.children.size();++i) {
+      if(d.children[i].text=="parameter-clause") function_suffix=true;
+      if(d.children[i].text.find("ptr-operator")==0) pointer_prefix=true;
+      if(d.children[i].text=="nested-declarator" && !d.children[i].children.empty())nested=&d.children[i].children[0];
+    }
+    if(pointer_prefix)return false;
+    if(nested)return declarator_denotes_function(*nested);
+    return function_suffix;
+  }
   Node parse_declaration_tail(const Node &specs, bool member) {
     if (member && at(":")) {
       Node bf = n("bit-field-declaration");
@@ -2607,14 +2669,13 @@ class Parser {
       need(";");
       return bf;
     }
-    bool direct_function = false, nested_declarator = false;
-    for (std::size_t i = 0; i < d.children.size(); ++i) {
-      if (d.children[i].text == "parameter-clause")
-        direct_function = true;
-      if (d.children[i].text == "nested-declarator")
-        nested_declarator = true;
+    bool direct_function=false,nested_declarator=false;
+    for(std::size_t i=0;i<d.children.size();++i) {
+      if(d.children[i].text=="parameter-clause")direct_function=true;
+      if(d.children[i].text=="nested-declarator")nested_declarator=true;
     }
-    if (at("try") && direct_function && !nested_declarator) {
+    const bool function_declarator=semantic_mode_ ? declarator_denotes_function(d) : direct_function&&!nested_declarator;
+    if (at("try") && function_declarator) {
       ++p_;
       ScopeGuard parameters(*this);
       expose_qualified_class_facts(d);
@@ -2649,7 +2710,7 @@ class Parser {
       fn.add(ft);
       return fn;
     }
-    if (at("{") && direct_function && !nested_declarator) {
+    if (at("{") && function_declarator) {
       if (member && !class_names_.empty() &&
           (name == current_class_simple() ||
            name == "~" + current_class_simple())) {
@@ -2682,14 +2743,12 @@ class Parser {
       item.add(d);
       // For declarations with a function suffix, `= default/delete` has its own
       // node.
-      bool fn = false, nested = false;
-      for (std::size_t i = 0; i < d.children.size(); ++i) {
-        if (d.children[i].text == "parameter-clause")
-          fn = true;
-        if (d.children[i].text == "nested-declarator")
-          nested = true;
+      bool direct_fn=false,nested_fn=false;
+      for(std::size_t i=0;i<d.children.size();++i) {
+        if(d.children[i].text=="parameter-clause")direct_fn=true;
+        if(d.children[i].text=="nested-declarator")nested_fn=true;
       }
-      fn = fn && !nested;
+      bool fn=semantic_mode_ ? declarator_denotes_function(d) : direct_fn&&!nested_fn;
       if (fn && take("=")) {
         std::string v = s();
         if (v == "default" || v == "delete") {
@@ -2848,12 +2907,13 @@ class Parser {
 
 public:
   explicit Parser(PostTokenBuffer &input, std::size_t first,
-                  std::size_t last, SyntaxArena &arena)
+                  std::size_t last, SyntaxArena &arena, bool semantic_mode)
       : arena_(arena), t_(input, first, last), p_(0),
         template_lookahead_work_(0), template_lookahead_budget_(0),
         tokens_(input), qualified_types_(tokens_),
         qualified_templates_(tokens_), force_type_names_(0),
-        active_template_declarations_(0) {
+        active_template_declarations_(0), semantic_mode_(semantic_mode) {
+    index_braces();
     const std::size_t max_size = static_cast<std::size_t>(-1);
     template_lookahead_budget_ =
         t_.size() > max_size / 4 ? max_size : t_.size() * 4;
@@ -2869,10 +2929,10 @@ public:
 } // namespace
 
 SyntaxTree parse_syntax_tree(PostTokenBuffer &tokens, std::size_t first,
-                             std::size_t last) {
+                             std::size_t last, bool semantic_mode) {
   SyntaxTree tree;
   tree.arena.reset(new SyntaxArena());
-  Parser parser(tokens, first, last, *tree.arena);
+  Parser parser(tokens, first, last, *tree.arena, semantic_mode);
   tree.root = parser.parse();
   tree.source_files = tokens.take_source_files();
   return tree;

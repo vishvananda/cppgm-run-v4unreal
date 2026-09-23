@@ -128,7 +128,8 @@ struct SyntaxTree {
 // Parse one independently preprocessed translation unit from a compact token
 // span. The resulting tree takes ownership of the immutable source buffers.
 SyntaxTree parse_syntax_tree(PostTokenBuffer &tokens,
-                             std::size_t first, std::size_t last);
+                             std::size_t first, std::size_t last,
+                             bool semantic_mode = false);
 void write_syntax_tree(const SyntaxTree &tree, std::ostream &output);
 void parse_and_dump_translation_unit(PostTokenBuffer &tokens,
                                      std::size_t first, std::size_t last,
