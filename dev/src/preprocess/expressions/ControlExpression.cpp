@@ -856,3 +856,67 @@ void run_control_expression_tool(const std::string & source, std::ostream & outp
   PPTokenizer tokenizer(source, stream);
   tokenizer.tokenize();
 }
+
+bool evaluate_control_expression_tokens(
+  const std::vector<ControlExpressionToken> & input, bool * result)
+{
+  try
+  {
+    std::vector<Token> tokens;
+    tokens.reserve(input.size());
+    for (std::size_t i = 0; i < input.size(); ++i)
+    {
+      const ControlExpressionToken & source = input[i];
+      if (source.kind == ControlExpressionToken::IDENTIFIER)
+      {
+        const bool odd = !source.spelling.empty() &&
+          (static_cast<unsigned char>(source.spelling[0]) & 1u) != 0;
+        tokens.push_back(Token(TOKEN_IDENTIFIER, Value(), OP_UNSUPPORTED,
+                              identifier_kind(source.spelling), true, odd));
+      }
+      else if (source.kind == ControlExpressionToken::PP_NUMBER)
+      {
+        Value value;
+        if (!parse_integer_literal(source.spelling, &value))
+          throw ExpressionFailure();
+        tokens.push_back(Token(TOKEN_VALUE, value));
+      }
+      else if (source.kind == ControlExpressionToken::CHARACTER_LITERAL)
+      {
+        Value value;
+        if (!parse_character_literal(source.spelling, &value))
+          throw ExpressionFailure();
+        tokens.push_back(Token(TOKEN_VALUE, value));
+      }
+      else if (source.kind == ControlExpressionToken::OPERATOR)
+      {
+        if (source.spelling == "new" || source.spelling == "delete")
+        {
+          tokens.push_back(Token(TOKEN_IDENTIFIER, Value(), OP_UNSUPPORTED,
+                                 identifier_kind(source.spelling), true,
+                                 !source.spelling.empty() &&
+                                 (static_cast<unsigned char>(source.spelling[0]) & 1u)));
+        }
+        else
+        {
+          const bool identifier = is_alternative_identifier(source.spelling);
+          const bool odd = !source.spelling.empty() &&
+            (static_cast<unsigned char>(source.spelling[0]) & 1u) != 0;
+          tokens.push_back(Token(TOKEN_OPERATOR, Value(),
+                                 operator_kind(source.spelling),
+                                 IDENTIFIER_OTHER, identifier, odd));
+        }
+      }
+      else
+        throw ExpressionFailure();
+    }
+    Parser parser(tokens);
+    const Value value = parser.parse();
+    if (result) *result = value.bits != 0;
+    return true;
+  }
+  catch (const ExpressionFailure &)
+  {
+    return false;
+  }
+}

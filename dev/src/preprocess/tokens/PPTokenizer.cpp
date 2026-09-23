@@ -607,7 +607,7 @@ private:
   void emit_comment_newline(const Unit & newline)
   {
     output_.set_source_location(newline.line, newline.column);
-    output_.emit_new_line();
+    output_.emit_comment_new_line();
     line_start_ = true;
     directive_ = 0;
   }

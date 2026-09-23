@@ -1,15 +1,23 @@
 # PA4 implementation plan and handoff ledger
 
-## Stage entry and design alignment
+## Stage entry, design and spec alignment
 
-- Stage base commit: `4c7867d2d7d0e26237fcab01eb8d4ea0af777242`; Last reviewed commit: `4c7867d2d7d0e26237fcab01eb8d4ea0af777242` (preserve both while implementing).
-- Current ownership path is `PPTokenizer` borrowed callbacks -> typed preprocessing tokens/directive state -> macro rescanner -> posttoken phase-5/7 adapter. The assignment has no produced C++ executable; compiler latency/RSS and preproc executable `.text` apply, generated runtime/text do not. No optimizer/IR budgets exist in PA4.
-- Current failure owner: `dev/preproc.cpp` is wholly NotImplemented, so all 105 failures share the missing preprocessor end-to-end behavior. Planned groups: (1) tokenization, macro definitions/argument collection/stringize/paste/rescan/recursion (O(produced tokens), macro state); (2) conditionals/directive ordering/error semantics; (3) includes, source locations/predefineds/line control/once/pragma; (4) integration/output and phase-7 validation. Data flows from one source buffer through PPTokenizer to one current file token cursor, with translation-unit state shared by includes and reset for each primary input. Validate incrementally with focused fixtures, full `make test-pa4`, explicit `student.tests/`, and through-PA4.
+- Stage base commit: `4c7867d2d7d0e26237fcab01eb8d4ea0af777242`; Last reviewed commit: `4c7867d2d7d0e26237fcab01eb8d4ea0af777242` (both preserved during implementation).
+- `PPTokenizer` now drives a per-file streaming `IPPTokenStream` consumer. Only the current logical line and pending maximal text-sequence/function-macro lookahead are retained; includes recurse through the same translation-unit state. The macro engine uses token-local persistent unavailable-name sets, raw and pre-expanded argument views, token-kind paste markers, and typed rescan. The source-file/line callbacks flow through to the posttoken consumer; the dump is an output adapter, not phase transport. Each primary source gets fresh macro/conditional/once/counter state.
+- The posttoken implementation is now a reusable typed consumer (`PostTokenPipeline`); `run_preprocessor_files` is a callable frontend entry point that emits expanded preprocessing-token callbacks, including locations. Output text and invalid phase-7 detection remain the CLI adapter's duties. Current-stage absence of C++ executable output makes generated runtime/text inapplicable; applicable compiler-tool latency/RSS and its `.text` are measured below. No optimizer/IR acceptance budget applies in PA4.
 
-## Remaining groups, evidence and ledger
+## Behavior groups and closure
 
-- Macro engine: owner `dev/src/preprocess`; raw/expanded parameter views and token-local unavailable-name paint; complexity target linear in input plus produced expansion tokens, with a defensive nesting limit only for malformed resource exhaustion. Required macro fixture groups are validation.
-- Directives/inclusion: same preprocessor state owner; conditional stack, include recursion, file identity, presumed file/line and builtins. Work proportional to directive/token/include work; validate all directive fixtures and multiple primary translation units.
-- Phase 5-7 integration: reuse PA2's typed posttoken callback consumer rather than serialize preprocessor tokens back into source; output PA2 record format. Validate invalid tokens, literal concatenation and exact checked output.
-- Performance evidence: pending implementation. Freeze compiler binary/flags/inputs, measure ABBA latency and peak RSS, and executable `.text`; no native generated program is produced. Preserve measurements and compare against stage-base equivalent behavior where meaningful. No self-imposed hard thresholds.
-- Handoff boundary: implementation and independent-review questions will be recorded separately after validation; no known defect or requirement is waived.
+- Macro replacement owner/data flow: `Preprocessor.cpp` -> `IPPTokenStream` callback -> macro table/deque rescanner -> typed posttoken consumer. Definition/redefinition validation, object/function/variadic invocation, nested argument collection, stringizing, placemarkers/paste, rescanning and course recursion suppression are implemented. Work is proportional to produced expansion tokens plus logarithmic persistent paint-set operations; argument expansions are cached per parameter per invocation. Validated by the complete macro bucket, including repeated-argument and recursion-boundary stress fixtures.
+- Directive/translation-unit owner: same preprocessor state; conditional ordering and lazy inactive handling, include search/identity-once, line/file/date/time/counter builtins, `_Pragma`, error/null/non-directive rules, and independent primary-source reset are implemented. Work tracks input, include and expansion tokens. Validated by the complete directives bucket and multiple-primary fixture.
+- Phase-5/7 integration owner: direct typed callback adapter (no generated-source roundtrip); literal/string concatenation and invalid tokens reuse PA2 posttoken conversion. All 105 course PA4 cases pass, coverage unchanged.
+
+## Reference preservation proof
+
+- No reference correction was made. The reduced personal input `student.tests/pa4-stringize-backslash.t` stringizes a standalone backslash preprocessing token followed by `n`. C++11 N3337 §16.3.2 [cpp.stringize]/2 retains the original spelling of each argument preprocessing token, with special escaping only while spelling string/character literal tokens. Thus this standalone backslash is not doubled; PA2 phase-5/7 then reads `\n` as a newline escape. The checked reference result (`array of 5 char`, `3A20400A00`) is correct. The bundle remains `c2f713cd70d06170632bfde3e75dd6fe1aa44d98` (`reference-binaries/manifest.tsv`); all fixtures and comparison rules are preserved.
+
+## Performance evidence and handoff ledger
+
+- No known current-stage implementation defect remains. Independent audit questions remain separate: audit the public callback ownership/lifetime and macro hideset traces across the entire stream, and independently re-check the cited reference correction. Neither waives the requirement or known implementation.
+- Measurement protocol/results: pending final committed-source measurements. No native executable is generated by PA4; compiler latency/peak RSS and preprocessor `.text` are applicable, runtime/text of generated programs are not. No self-imposed hard threshold.
+- Required checks to rerun after final commit: `make test-pa4`, `make test-report-through-pa4`, and `perl scripts/cppgm_file_audit.pl --stage pa4 --paths dev/src`; explicit personal reducer check and clean committed worktree.

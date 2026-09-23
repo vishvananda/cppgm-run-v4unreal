@@ -1,0 +1,4 @@
+preproc 1
+sof student.tests/pa4-stringize-backslash.t
+literal ": @\n" array of 5 char 3A20400A00
+eof
