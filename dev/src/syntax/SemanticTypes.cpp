@@ -2073,6 +2073,24 @@ class Analyzer {
     if(!body)return;
     process_statement(*body,fn_scope,owner,true);
   }
+  void process_substatement(const Node &node,int scope) {
+    if(node.text=="then"||node.text=="else") {
+      if(node.children.empty())return;
+      if(node.children[0].text=="compound-statement") {
+        process_statement(node,scope,scope,false);
+      } else {
+        int substatement_scope=add_scope("block","",scope,true,node.location);
+        process_statement(node,substatement_scope,substatement_scope,false);
+      }
+      return;
+    }
+    if(node.text=="compound-statement") {
+      process_statement(node,scope,scope,false);
+      return;
+    }
+    int substatement_scope=add_scope("block","",scope,true,node.location);
+    process_statement(node,substatement_scope,substatement_scope,false);
+  }
   void process_statement(const Node &node,int scope,int owner,bool force_block=false) {
     if(node.text.compare(0,15,"call-expression")==0 && !node.children.empty() &&
        node.children[0].text.compare(0,14,"id-expression ")==0 &&
@@ -2114,6 +2132,33 @@ class Analyzer {
       int block=add_scope("block","",scope,true,node.location);
       for(std::size_t i=0;i<node.children.size();++i)
         process_statement(node.children[i],block,block,false);
+      return;
+    }
+    // Selection and iteration statements own their condition/initializer
+    // declarations. A for-init name must disappear after the loop; a
+    // condition-declaration is shared by its substatements but not by the
+    // containing compound statement.
+    if(node.text=="if-statement" || node.text=="switch-statement" ||
+       node.text=="while-statement" || node.text=="for-statement") {
+      int statement_scope=add_scope("block","",scope,true,node.location);
+      if(node.text=="if-statement") {
+        if(!node.children.empty())process_statement(node.children[0],statement_scope,statement_scope,false);
+        for(std::size_t i=1;i<node.children.size();++i)
+          process_substatement(node.children[i],statement_scope);
+      } else if(node.text=="while-statement"||node.text=="switch-statement") {
+        if(!node.children.empty())process_statement(node.children[0],statement_scope,statement_scope,false);
+        if(node.children.size()>1)process_substatement(node.children[1],statement_scope);
+      } else {
+        for(std::size_t i=0;i+1<node.children.size();++i)
+          process_statement(node.children[i],statement_scope,statement_scope,false);
+        if(!node.children.empty())process_substatement(node.children.back(),statement_scope);
+      }
+      return;
+    }
+    if(node.text=="do-statement") {
+      if(!node.children.empty())process_substatement(node.children[0],scope);
+      for(std::size_t i=1;i<node.children.size();++i)
+        process_statement(node.children[i],scope,owner,false);
       return;
     }
     if(node.text=="function-try-block") {
@@ -2374,6 +2419,31 @@ public:
     for(std::size_t i=0;i<indices->size();++i)out.push_back(binding_info(scope,(*indices)[i]));
     return out;
   }
+  std::vector<int> binding_indices_named(int scope,SemanticNameId name) const {
+    std::vector<int> out;
+    if(scope<0||scope>=static_cast<int>(scopes_.size()))return out;
+    const BindingIndices *indices=scopes_[scope].by_name.find(name);
+    if(!indices)return out;
+    out.reserve(indices->size());
+    for(std::size_t i=0;i<indices->size();++i)out.push_back((*indices)[i]);
+    return out;
+  }
+  SemanticLookupResult binding_at(int scope,SemanticNameId name,
+                                  const SyntaxLocation &location) const {
+    SemanticLookupResult out;
+    if(scope<0||scope>=static_cast<int>(scopes_.size()))return out;
+    const BindingIndices *indices=scopes_[scope].by_name.find(name);
+    if(!indices||indices->empty())return out;
+    int fallback=(*indices)[0];
+    for(std::size_t i=0;i<indices->size();++i) {
+      const int index=(*indices)[i];
+      const Binding &b=scopes_[scope].bindings[index];
+      if(location.valid()&&b.location.valid()&&b.location.packed==location.packed) {
+        out.scope=scope;out.binding_index=index;return out;
+      }
+    }
+    out.scope=scope;out.binding_index=fallback;return out;
+  }
   SemanticBindingInfo binding_info(int scope,int index) const {
     if(scope<0 || scope>=static_cast<int>(scopes_.size()) || index<0 ||
        index>=static_cast<int>(scopes_[scope].bindings.size()))
@@ -2471,6 +2541,13 @@ SemanticBindingInfo SemanticModel::binding(SemanticScopeId scope,std::size_t ind
 }
 std::vector<SemanticBindingInfo> SemanticModel::bindings_named(SemanticScopeId scope,SemanticNameId name) const {
   return impl_->analyzer.bindings_named_info(scope,name);
+}
+std::vector<int> SemanticModel::binding_indices_named(SemanticScopeId scope,SemanticNameId name) const {
+  return impl_->analyzer.binding_indices_named(scope,name);
+}
+SemanticLookupResult SemanticModel::binding_at(SemanticScopeId scope,SemanticNameId name,
+                                               const SyntaxLocation &location) const {
+  return impl_->analyzer.binding_at(scope,name,location);
 }
 SemanticEntityInfo SemanticModel::entity(SemanticEntityId id) const { return impl_->analyzer.entity_info(id); }
 SemanticFunctionSignatureInfo SemanticModel::function_signature(SemanticSignatureId id) const { return impl_->analyzer.signature_info(id); }

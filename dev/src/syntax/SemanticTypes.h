@@ -129,6 +129,9 @@ public:
   SemanticScopeInfo scope(SemanticScopeId id) const;
   SemanticBindingInfo binding(SemanticScopeId scope, std::size_t index) const;
   std::vector<SemanticBindingInfo> bindings_named(SemanticScopeId scope, SemanticNameId name) const;
+  std::vector<int> binding_indices_named(SemanticScopeId scope, SemanticNameId name) const;
+  SemanticLookupResult binding_at(SemanticScopeId scope, SemanticNameId name,
+                                  const SyntaxLocation &location) const;
   SemanticEntityInfo entity(SemanticEntityId id) const;
   SemanticFunctionSignatureInfo function_signature(SemanticSignatureId id) const;
   SemanticTypeId signature_parameter(SemanticSignatureId id, std::size_t index) const;

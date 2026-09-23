@@ -5,12 +5,15 @@
 #include <cctype>
 #include <climits>
 #include <cstdlib>
+#include <deque>
 #include <map>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -24,13 +27,19 @@ enum { T_BUILTIN=SEMANTIC_BUILTIN, T_CLASS=SEMANTIC_CLASS,
 
 struct CType {
   int kind;
+  // Nonnegative only for a borrowed projection of an immutable SemanticTypeId.
+  // Synthetic conversions clear this key and use structural comparison.
+  int canonical_id;
+  int template_parameter_id;
   std::string name;
-  std::shared_ptr<CType> base;
+  CType *base;
+  CType *enum_underlying;
   std::vector<CType> params;
   unsigned long long bound;
   int owner;
   bool is_const, is_volatile, scoped, variadic;
-  CType() : kind(T_BUILTIN), bound(0), owner(-1), is_const(false),
+  CType() : kind(T_BUILTIN), canonical_id(-1), template_parameter_id(-1),
+            base(0), enum_underlying(0), bound(0), owner(-1), is_const(false),
             is_volatile(false), scoped(false), variadic(false) {}
 };
 
@@ -54,7 +63,16 @@ struct ExprInfo {
 struct Conversion {
   bool viable;
   int rank;
-  Conversion(bool v=false, int r=99) : viable(v), rank(r) {}
+  bool reference_binding;
+  int reference_kind; // 1 = lvalue reference, 2 = rvalue reference
+  int qualification_steps;
+  bool direct_reference_binding;
+  bool binds_rvalue;
+  Conversion(bool v=false, int r=99, bool ref=false, int ref_kind=0,
+             int qualifications=0, bool direct=false, bool rvalue=false)
+      : viable(v), rank(r), reference_binding(ref),
+        reference_kind(ref_kind), qualification_steps(qualifications),
+        direct_reference_binding(direct), binds_rvalue(rvalue) {}
 };
 
 static std::string trim(const std::string &s) {
@@ -109,11 +127,37 @@ class CallSemantics {
   SemanticModel &model_;
   const Node &root_;
   int global_;
-  std::map<int,long long> switch_cases_;
+  struct SwitchFrame {
+    std::unordered_set<unsigned long long> labels;
+    CType condition_type;
+    bool has_default;
+    SwitchFrame():has_default(false){}
+  };
+  std::vector<SwitchFrame> switch_frames_;
   std::vector<CType> demanded_constructors_;
   struct TemplateInstantiation { std::string name; CType function; int entity; };
   std::vector<TemplateInstantiation> template_instantiations_;
-  std::unordered_map<SemanticNameId,std::vector<BindingRef> > template_functions_by_name_;
+  struct ScopeNameKey {
+    int scope;
+    SemanticNameId name;
+    ScopeNameKey(int s=-1,SemanticNameId n=UINT32_MAX):scope(s),name(n){}
+    bool operator==(const ScopeNameKey &other) const {
+      return scope==other.scope && name==other.name;
+    }
+  };
+  struct ScopeNameHash {
+    std::size_t operator()(const ScopeNameKey &key) const {
+      return std::hash<int>()(key.scope) ^
+        (std::hash<SemanticNameId>()(key.name)+0x9e3779b9U+
+         (static_cast<std::size_t>(key.scope)<<6));
+    }
+  };
+  std::unordered_map<ScopeNameKey,std::vector<BindingRef>,ScopeNameHash> template_functions_by_scope_name_;
+  // A TU-local, immutable-type projection cache. SemanticTypeIds remain the
+  // equality keys; CType is just the PA7 formatter/conversion adapter.
+  mutable std::deque<CType> type_arena_;
+  mutable std::vector<CType> canonical_type_cache_;
+  mutable std::vector<unsigned char> canonical_type_cached_;
   std::unordered_map<SemanticNameId,std::vector<BindingRef> > anonymous_union_members_by_name_;
   std::unordered_map<ScopeLocationKey,std::vector<int>,ScopeLocationHash> scopes_by_location_;
   mutable std::map<int,std::string> anonymous_class_names_;
@@ -153,10 +197,22 @@ class CallSemantics {
     std::ostringstream name;name<<"__anonymous_enum"<<(++anonymous_enum_serial_);
     anonymous_enum_names_[owner]=name.str();return name.str();
   }
+  CType *store_type(const CType &type) const {
+    type_arena_.push_back(type);
+    return &type_arena_.back();
+  }
   CType from_type_id(int id) const {
     if(id<0)return CType();
+    if(static_cast<std::size_t>(id)>=canonical_type_cache_.size()) {
+      const std::size_t needed=static_cast<std::size_t>(id)+1;
+      canonical_type_cache_.resize(needed);
+      canonical_type_cached_.resize(needed,0);
+    }
+    if(canonical_type_cached_[static_cast<std::size_t>(id)])
+      return canonical_type_cache_[static_cast<std::size_t>(id)];
     SemanticTypeInfo info=model_.type(id);
-    CType t; t.kind=static_cast<int>(info.kind); t.bound=info.array_bound;
+    CType t; t.kind=static_cast<int>(info.kind); t.canonical_id=id; t.bound=info.array_bound;
+    if(info.kind==SEMANTIC_BUILTIN&&info.owner_scope>=0)t.template_parameter_id=id;
     t.is_const=info.is_const; t.is_volatile=info.is_volatile;
     t.scoped=info.scoped; t.variadic=info.variadic; t.owner=info.owner_scope;
     if(info.name!=UINT32_MAX)t.name=model_.name_text(info.name);
@@ -182,12 +238,14 @@ class CallSemantics {
         if(t.name.find("__anonymous_enum__")==0)t.name=synthetic_enum_name(info.owner_scope);
         else t.name=model_.name_text(model_.scope(info.owner_scope).name);
       }
+      if(info.enum_underlying_type>=0)
+        t.enum_underlying=store_type(from_type_id(info.enum_underlying_type));
       t.name=std::string(info.scoped?"enum class ":"enum ")+t.name;
     }
     if(info.kind==SEMANTIC_CV || info.kind==SEMANTIC_POINTER ||
        info.kind==SEMANTIC_LVALUE_REFERENCE || info.kind==SEMANTIC_RVALUE_REFERENCE ||
        info.kind==SEMANTIC_ARRAY || info.kind==SEMANTIC_MEMBER_POINTER) {
-      t.base.reset(new CType(from_type_id(info.base)));
+      t.base=store_type(from_type_id(info.base));
       if(info.kind==SEMANTIC_MEMBER_POINTER && info.owner_scope>=0) {
         SemanticScopeInfo owner=model_.scope(info.owner_scope);
         if(owner.parent>=0) {
@@ -200,7 +258,7 @@ class CallSemantics {
         if(t.name.empty())t.name="struct "+model_.name_text(owner.name);
       }
     } else if(info.kind==SEMANTIC_FUNCTION) {
-      t.base.reset(new CType(from_type_id(info.base)));
+      t.base=store_type(from_type_id(info.base));
       for(std::size_t i=0;i<info.parameter_count;++i) {
         CType p=from_type_id(model_.type_parameter(id,i));
         if(p.kind==T_CV&&p.base)p=*p.base;
@@ -209,13 +267,15 @@ class CallSemantics {
         t.params.push_back(p);
       }
     }
+    canonical_type_cache_[static_cast<std::size_t>(id)]=t;
+    canonical_type_cached_[static_cast<std::size_t>(id)]=1;
     return t;
   }
   static CType builtin(const std::string &name) {
     CType t; t.kind=T_BUILTIN; t.name=name; return t;
   }
-  static CType derived(int kind,const CType &base) {
-    CType t; t.kind=kind; t.base.reset(new CType(base)); return t;
+  CType derived(int kind,const CType &base) const {
+    CType t; t.kind=kind; t.base=store_type(base); return t;
   }
   static bool is_ref(const CType &t) { return t.kind==T_LREF || t.kind==T_RREF; }
   static CType referred(const CType &t) { return is_ref(t)&&t.base?*t.base:t; }
@@ -282,17 +342,29 @@ class CallSemantics {
   static CType expression_type(const CType &t) { return referred(t); }
   static bool type_equal(CType a,CType b,bool ignore_top_cv=false) {
     if(ignore_top_cv){a=unqualified(a);b=unqualified(b);}
+    if(a.canonical_id>=0 && b.canonical_id>=0)
+      return a.canonical_id==b.canonical_id;
     if(a.kind!=b.kind)return false;
-    if(a.kind==T_BUILTIN || a.kind==T_CLASS || a.kind==T_ENUM)
+    if(a.kind==T_BUILTIN) {
+      if(a.template_parameter_id>=0||b.template_parameter_id>=0)
+        return a.template_parameter_id==b.template_parameter_id;
+      return a.name==b.name;
+    }
+    if(a.kind==T_CLASS || a.kind==T_ENUM) {
+      if(a.owner>=0 && b.owner>=0)
+        return a.owner==b.owner && (a.kind!=T_ENUM || a.scoped==b.scoped);
       return a.name==b.name && a.owner==b.owner && a.scoped==b.scoped;
+    }
     if(a.kind==T_CV && (a.is_const!=b.is_const || a.is_volatile!=b.is_volatile))return false;
     if(a.kind==T_ARRAY && a.bound!=b.bound)return false;
     if(a.kind==T_FUNCTION) {
-      if(a.variadic!=b.variadic || a.params.size()!=b.params.size())return false;
+      if(a.variadic!=b.variadic || a.params.size()!=b.params.size() ||
+         a.is_const!=b.is_const || a.is_volatile!=b.is_volatile)return false;
       if(!a.base || !b.base || !type_equal(*a.base,*b.base))return false;
       for(std::size_t i=0;i<a.params.size();++i)if(!type_equal(a.params[i],b.params[i]))return false;
       return true;
     }
+    if(a.kind==T_MEMBER_POINTER && a.owner!=b.owner)return false;
     return a.base && b.base && type_equal(*a.base,*b.base);
   }
   int resolve_scope(const std::string &name,int scope) const {
@@ -330,20 +402,15 @@ class CallSemantics {
     return out;
   }
   BindingRef binding_at(int scope,const std::string &name,const SyntaxLocation &location) const {
-    BindingRef fallback;
+    BindingRef out;
     SemanticNameId id=model_.find_name(name);
-    if(id==UINT32_MAX)return fallback;
-    if(scope<0 || static_cast<std::size_t>(scope)>=model_.scope_count())return fallback;
-    SemanticScopeInfo s=model_.scope(scope);
-    for(std::size_t i=0;i<s.binding_count;++i) {
-      SemanticBindingInfo b=model_.binding(scope,i);
-      if(b.name!=id)continue;
-      if(!fallback.valid()){fallback.scope=scope;fallback.index=static_cast<int>(i);fallback.value=b;}
-      if(location.valid()&&b.location.valid()&&b.location.packed==location.packed) {
-        BindingRef result;result.scope=scope;result.index=static_cast<int>(i);result.value=b;return result;
-      }
+    if(id==UINT32_MAX)return out;
+    SemanticLookupResult found=model_.binding_at(scope,id,location);
+    if(found.scope>=0&&found.binding_index>=0) {
+      out.scope=found.scope;out.index=found.binding_index;
+      out.value=model_.binding(found.scope,static_cast<std::size_t>(found.binding_index));
     }
-    return fallback;
+    return out;
   }
   static bool fundamental_type_name(const std::string &name,std::string &canonical) {
     static const char *names[]={"void","bool","char","signed char","unsigned char","char16_t","char32_t","wchar_t","short","short int","unsigned short","unsigned short int","int","unsigned","unsigned int","long","long int","unsigned long","unsigned long int","long long","long long int","unsigned long long","unsigned long long int","float","double","long double","nullptr_t"};
@@ -351,31 +418,225 @@ class CallSemantics {
     for(std::size_t i=0;i<sizeof(names)/sizeof(*names);++i)if(name==names[i]){canonical=types[i];return true;}
     return false;
   }
+  static bool hex_digit(char c) {
+    return (c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F');
+  }
+  static unsigned escape_digits(const std::string &text,std::size_t at,
+                                unsigned maximum,unsigned base) {
+    unsigned count=0;
+    while(at+count<text.size()&&count<maximum) {
+      const char c=text[at+count];
+      const bool valid=base==8?(c>='0'&&c<='7'):base==16?hex_digit(c):(c>='0'&&c<='9');
+      if(!valid)break;
+      ++count;
+    }
+    return count;
+  }
+  static unsigned long long decode_character_value(const std::string &text,
+                                                    std::size_t begin,
+                                                    std::size_t end) {
+    if(begin>=end)return 0;
+    if(text[begin]!='\\')return static_cast<unsigned char>(text[begin]);
+    if(begin+1>=end)return 0;
+    const char c=text[begin+1];
+    switch(c) {
+    case '\'': return '\''; case '"': return '"'; case '?': return '?';
+    case '\\': return '\\'; case 'a': return 7; case 'b': return 8;
+    case 'f': return 12; case 'n': return 10; case 'r': return 13;
+    case 't': return 9; case 'v': return 11;
+    default: break;
+    }
+    if(c>='0'&&c<='7') {
+      unsigned long long value=0;unsigned n=escape_digits(text,begin+1,3,8);
+      for(unsigned i=0;i<n;++i)value=value*8+static_cast<unsigned>(text[begin+1+i]-'0');
+      return value;
+    }
+    if(c=='x') {
+      unsigned long long value=0;unsigned n=escape_digits(text,begin+2,64,16);
+      for(unsigned i=0;i<n;++i) {
+        const char d=text[begin+2+i];
+        value=value*16+static_cast<unsigned>(d<='9'?d-'0':(d|32)-'a'+10);
+      }
+      return value;
+    }
+    if(c=='u'||c=='U') {
+      unsigned digits=c=='u'?4:8;unsigned long long value=0;
+      for(unsigned i=0;i<digits&&begin+2+i<end;++i) {
+        const char d=text[begin+2+i];
+        value=value*16+static_cast<unsigned>(d<='9'?d-'0':(d|32)-'a'+10);
+      }
+      return value;
+    }
+    return static_cast<unsigned char>(c);
+  }
+  static std::size_t literal_character_count(const std::string &text,
+                                             std::size_t begin,
+                                             std::size_t end) {
+    std::size_t count=0;
+    for(std::size_t i=begin;i<end;) {
+      if(text[i]!='\\') {++i;++count;continue;}
+      ++i;
+      if(i>=end)break;
+      const char c=text[i++];
+      if(c>='0'&&c<='7')i+=escape_digits(text,i-1,3,8)-1;
+      else if(c=='x')i+=escape_digits(text,i,64,16);
+      else if(c=='u')i=std::min(end,i+4);
+      else if(c=='U')i=std::min(end,i+8);
+      ++count;
+    }
+    return count;
+  }
+  static unsigned long long string_literal_units(const std::string &text,
+                                                  std::size_t begin,
+                                                  std::size_t end,
+                                                  const std::string &prefix,
+                                                  bool raw) {
+    if(raw)return static_cast<unsigned long long>(end-begin)+1;
+    unsigned long long count=0;
+    const bool utf16=prefix.find('u')!=std::string::npos && prefix.find("u8")==std::string::npos;
+    const bool utf32=prefix.find('U')!=std::string::npos;
+    for(std::size_t i=begin;i<end;) {
+      if(text[i]!='\\') {++i;++count;continue;}
+      ++i;
+      if(i>=end)break;
+      const char c=text[i++];
+      if(c>='0'&&c<='7')i+=escape_digits(text,i-1,3,8)-1;
+      else if(c=='x')i+=escape_digits(text,i,64,16);
+      else if(c=='u'||c=='U') {
+        const unsigned digits=c=='u'?4:8;
+        unsigned long long value=0;
+        for(unsigned d=0;d<digits&&i<end;++d,++i) {
+          const char x=text[i];
+          value=value*16+static_cast<unsigned>(x<='9'?x-'0':(x|32)-'a'+10);
+        }
+        if(utf16&&value>0xffff)count+=2;
+        else if(!utf16&&!utf32&&value>0x7f)count+=value<=0x7ff?2:value<=0xffff?3:4;
+        else ++count;
+        continue;
+      }
+      ++count;
+    }
+    return count+1; // terminating zero code unit
+  }
+  static std::string integer_literal_type(const std::string &digits,
+                                         bool is_unsigned,unsigned longs,
+                                         unsigned long long value) {
+    const bool decimal=digits.empty() || digits[0]!='0' || digits.size()==1;
+    const unsigned long long imax=static_cast<unsigned long long>(std::numeric_limits<int>::max());
+    const unsigned long long umax=static_cast<unsigned long long>(std::numeric_limits<unsigned int>::max());
+    const unsigned long long lmax=static_cast<unsigned long long>(std::numeric_limits<long>::max());
+    const unsigned long long ulmax=static_cast<unsigned long long>(std::numeric_limits<unsigned long>::max());
+    const unsigned long long llmax=static_cast<unsigned long long>(std::numeric_limits<long long>::max());
+    const unsigned long long ullmax=std::numeric_limits<unsigned long long>::max();
+    if(is_unsigned) {
+      if(longs==0) {
+        if(value<=umax)return "unsigned int";
+        if(value<=ulmax)return "unsigned long int";
+        return "unsigned long long int";
+      }
+      if(longs==1) {
+        if(value<=ulmax)return "unsigned long int";
+        return "unsigned long long int";
+      }
+      return "unsigned long long int";
+    }
+    if(longs>=2) {
+      if(value<=llmax)return "long long int";
+      if(!decimal&&value<=ullmax)return "unsigned long long int";
+      throw std::runtime_error("integer literal has no representable type");
+    }
+    if(longs==1) {
+      if(value<=lmax)return "long int";
+      if(!decimal&&value<=ulmax)return "unsigned long int";
+      if(value<=llmax)return "long long int";
+      if(!decimal)return "unsigned long long int";
+      throw std::runtime_error("integer literal has no representable type");
+    }
+    if(value<=imax)return "int";
+    if(!decimal&&value<=umax)return "unsigned int";
+    if(value<=lmax)return "long int";
+    if(!decimal&&value<=ulmax)return "unsigned long int";
+    if(value<=llmax)return "long long int";
+    if(!decimal)return "unsigned long long int";
+    throw std::runtime_error("integer literal has no representable type");
+  }
+  void append_function_candidate(std::vector<BindingRef> &out,
+                                 std::unordered_set<int> &seen,
+                                 const BindingRef &candidate) const {
+    if(!candidate.valid() || candidate.value.kind!=SEMANTIC_FUNCTION_BINDING)return;
+    const int identity=candidate.value.function_identity;
+    if(identity>=0 && !seen.insert(identity).second)return;
+    if(identity<0) {
+      for(std::size_t i=0;i<out.size();++i)
+        if(out[i].value.entity==candidate.value.entity &&
+           out[i].value.type==candidate.value.type)return;
+    }
+    out.push_back(candidate);
+  }
+  int template_owner_scope(const std::string &name,int scope,
+                           const BindingRef &ordinary) const {
+    if(ordinary.valid())return ordinary.scope;
+    std::vector<std::string> parts=split_name(name);
+    if(parts.empty())return -1;
+    const SemanticNameId id=model_.find_name(parts.back());
+    if(id==UINT32_MAX)return -1;
+    if(name.find("::")!=std::string::npos) {
+      if(parts.size()==1)return global_;
+      std::vector<SemanticNameId> prefix;
+      for(std::size_t i=0;i+1<parts.size();++i) {
+        SemanticNameId component=model_.find_name(parts[i]);
+        if(component==UINT32_MAX)return -1;
+        prefix.push_back(component);
+      }
+      const bool absolute=name.compare(0,2,"::")==0;
+      SemanticLookupResult parent=prefix.size()==1 ?
+          model_.lookup_unqualified(absolute?global_:scope,prefix[0]) :
+          model_.lookup_qualified(scope,prefix,absolute);
+      if(parent.scope<0 || parent.binding_index<0)return -1;
+      SemanticBindingInfo binding=model_.binding(
+          parent.scope,static_cast<std::size_t>(parent.binding_index));
+      if(binding.target_scope>=0)return binding.target_scope;
+      if(binding.type>=0) {
+        CType type=unqualified(from_type_id(binding.type));
+        if(type.kind==T_CLASS || type.kind==T_ENUM)return type.owner;
+      }
+      return -1;
+    }
+    for(int current=scope;current>=0;current=model_.scope(current).parent) {
+      if(template_functions_by_scope_name_.find(ScopeNameKey(current,id))!=
+         template_functions_by_scope_name_.end())return current;
+    }
+    return -1;
+  }
   std::vector<BindingRef> function_set(const std::string &name,int scope) const {
     std::string lookup_name=name;
     std::size_t angle=lookup_name.find('<');
     if(angle!=std::string::npos)lookup_name=lookup_name.substr(0,angle);
     std::vector<BindingRef> out;
     BindingRef first=lookup(lookup_name,scope);
-    if(first.valid() && first.value.kind==SEMANTIC_FUNCTION_BINDING) {
-      SemanticNameId id=model_.find_name(split_name(lookup_name).back());
-      std::vector<SemanticBindingInfo> named=model_.bindings_named(first.scope,id);
-      for(std::size_t i=0;i<named.size();++i) {
-        const SemanticBindingInfo &b=named[i];
-        if(b.kind!=SEMANTIC_FUNCTION_BINDING)continue;
-        bool duplicate=false;
-        for(std::size_t j=0;j<out.size();++j)if(out[j].value.function_identity==b.function_identity)duplicate=true;
-        if(!duplicate) {
-          BindingRef x;x.scope=first.scope;x.index=first.index;x.value=b;
-          out.push_back(x);
-        }
-      }
-      if(out.empty())out.push_back(first);
-      return out;
-    }
+    // Ordinary declarations hide all outer functions, including templates.
+    if(first.valid() && first.value.kind!=SEMANTIC_FUNCTION_BINDING)return out;
+    std::unordered_set<int> seen;
     SemanticNameId id=model_.find_name(split_name(lookup_name).back());
-    std::unordered_map<SemanticNameId,std::vector<BindingRef> >::const_iterator found=template_functions_by_name_.find(id);
-    if(found!=template_functions_by_name_.end())return found->second;
+    if(id==UINT32_MAX)return out;
+    if(first.valid()) {
+      std::vector<int> indices=model_.binding_indices_named(first.scope,id);
+      for(std::size_t i=0;i<indices.size();++i) {
+        const int index=indices[i];
+        SemanticBindingInfo b=model_.binding(first.scope,static_cast<std::size_t>(index));
+        if(b.kind!=SEMANTIC_FUNCTION_BINDING)continue;
+        BindingRef x;x.scope=first.scope;x.index=index;x.value=b;
+        append_function_candidate(out,seen,x);
+      }
+    }
+    const int template_owner=template_owner_scope(lookup_name,scope,first);
+    if(template_owner>=0) {
+      std::unordered_map<ScopeNameKey,std::vector<BindingRef>,ScopeNameHash>::const_iterator found=
+          template_functions_by_scope_name_.find(ScopeNameKey(template_owner,id));
+      if(found!=template_functions_by_scope_name_.end())
+        for(std::size_t i=0;i<found->second.size();++i)
+          append_function_candidate(out,seen,found->second[i]);
+    }
     return out;
   }
   void build_semantic_indexes() {
@@ -386,7 +647,7 @@ class CallSemantics {
         SemanticBindingInfo b=model_.binding(static_cast<int>(s),i);
         if(b.kind==SEMANTIC_FUNCTION_BINDING&&scope.kind==SEMANTIC_TEMPLATE_PARAMETERS) {
           BindingRef ref;ref.scope=static_cast<int>(s);ref.index=static_cast<int>(i);ref.value=b;
-          template_functions_by_name_[b.name].push_back(ref);
+          template_functions_by_scope_name_[ScopeNameKey(scope.parent,b.name)].push_back(ref);
         }
         if(b.kind==SEMANTIC_VARIABLE&&scope.kind==SEMANTIC_CLASS_SCOPE&&scope.union_class) {
           BindingRef ref;ref.scope=static_cast<int>(s);ref.index=static_cast<int>(i);ref.value=b;
@@ -399,18 +660,19 @@ class CallSemantics {
     return function.valid() && model_.scope(function.scope).kind==SEMANTIC_TEMPLATE_PARAMETERS;
   }
   bool deduce_template_type(const CType &pattern,const CType &actual,
-                            std::map<std::string,CType> &substitutions) const {
-    if(pattern.kind==T_BUILTIN && pattern.name.compare(0,9,"typename ")==0) {
-      std::string name=pattern.name.substr(9);
-      std::map<std::string,CType>::iterator it=substitutions.find(name);
-      if(it==substitutions.end()){substitutions[name]=actual;return true;}
+                            std::map<int,CType> &substitutions) const {
+    if(pattern.template_parameter_id>=0) {
+      std::map<int,CType>::iterator it=substitutions.find(pattern.template_parameter_id);
+      if(it==substitutions.end()) {
+        substitutions[pattern.template_parameter_id]=actual;return true;
+      }
       return type_equal(it->second,actual);
     }
     if(pattern.kind==actual.kind) {
       if(pattern.kind==T_POINTER||pattern.kind==T_LREF||pattern.kind==T_RREF||pattern.kind==T_ARRAY||pattern.kind==T_CV||pattern.kind==T_MEMBER_POINTER) {
         if(pattern.kind==T_ARRAY&&pattern.bound!=actual.bound)return false;
         if(pattern.kind==T_CV&&(pattern.is_const!=actual.is_const||pattern.is_volatile!=actual.is_volatile))return false;
-        if(pattern.kind==T_MEMBER_POINTER && pattern.name!=actual.name)return false;
+        if(pattern.kind==T_MEMBER_POINTER && pattern.owner!=actual.owner)return false;
         return pattern.base&&actual.base&&deduce_template_type(*pattern.base,*actual.base,substitutions);
       }
       if(pattern.kind==T_FUNCTION) {
@@ -422,13 +684,14 @@ class CallSemantics {
     }
     return false;
   }
-  CType substitute_template_type(const CType &pattern,const std::map<std::string,CType> &substitutions) const {
-    if(pattern.kind==T_BUILTIN && pattern.name.compare(0,9,"typename ")==0) {
-      std::map<std::string,CType>::const_iterator found=substitutions.find(pattern.name.substr(9));
+  CType substitute_template_type(const CType &pattern,const std::map<int,CType> &substitutions) const {
+    if(pattern.template_parameter_id>=0) {
+      std::map<int,CType>::const_iterator found=substitutions.find(pattern.template_parameter_id);
       if(found!=substitutions.end())return found->second;
     }
     CType out=pattern;
-    if(pattern.base)out.base.reset(new CType(substitute_template_type(*pattern.base,substitutions)));
+    out.canonical_id=-1;
+    if(pattern.base)out.base=store_type(substitute_template_type(*pattern.base,substitutions));
     for(std::size_t i=0;i<pattern.params.size();++i)out.params[i]=substitute_template_type(pattern.params[i],substitutions);
     return out;
   }
@@ -437,22 +700,22 @@ class CallSemantics {
                                       const CType *expected) const {
     CType function=from_type_id(binding.value.type);
     if(!is_template_function(binding))return function;
-    std::map<std::string,CType> substitutions;
+    std::map<int,CType> substitutions;
     SemanticScopeInfo template_scope=model_.scope(binding.scope);
-    std::vector<std::string> parameter_names;
+    std::vector<int> parameter_types;
     for(std::size_t i=0;i<template_scope.binding_count;++i) {
       SemanticBindingInfo b=model_.binding(binding.scope,i);
-      if(b.kind==SEMANTIC_TYPE)parameter_names.push_back(model_.name_text(b.name));
+      if(b.kind==SEMANTIC_TYPE)parameter_types.push_back(b.type);
     }
     std::size_t angle=spelling.find('<');
     if(angle!=std::string::npos) {
       std::size_t close=spelling.find('>',angle+1);
       if(close!=std::string::npos) {
         std::vector<std::string> args=split_name(spelling.substr(angle+1,close-angle-1));
-        for(std::size_t i=0;i<args.size()&&i<parameter_names.size();++i) {
+        for(std::size_t i=0;i<args.size()&&i<parameter_types.size();++i) {
           BindingRef type_binding=lookup(args[i],scope);
           if(type_binding.valid()&&(type_binding.value.kind==SEMANTIC_TYPE||type_binding.value.kind==SEMANTIC_TYPE_ALIAS))
-            substitutions[parameter_names[i]]=from_type_id(type_binding.value.type);
+            substitutions[parameter_types[i]]=from_type_id(type_binding.value.type);
         }
       }
     }
@@ -482,16 +745,6 @@ class CallSemantics {
         SemanticBindingInfo b=model_.binding(found.scope,static_cast<std::size_t>(found.binding_index));
         if(b.type>=0) {
           CType type=from_type_id(b.type);
-          if(cls.union_class) {
-            std::string raw=model_.name_text(cls.name);
-            std::map<int,std::string>::const_iterator un=anonymous_union_names_.find(class_scope);
-            std::map<int,std::string>::const_iterator an=anonymous_class_names_.find(class_scope);
-            if(un!=anonymous_union_names_.end())raw=un->second;
-            else if(an!=anonymous_class_names_.end())raw=an->second;
-            CType *leaf=&type;
-            while(leaf->kind==T_CV&&leaf->base)leaf=leaf->base.get();
-            leaf->name="union "+raw;
-          }
           return type;
         }
       }
@@ -510,7 +763,7 @@ class CallSemantics {
     CType object=class_type_for_scope(owner_scope);
     object=add_cv(object,type.is_const,type.is_volatile);
     type.params.insert(type.params.begin(),derived(T_POINTER,object));
-    type.is_const=false;type.is_volatile=false;
+    type.is_const=false;type.is_volatile=false;type.canonical_id=-1;
     return type;
   }
   std::string canonical_function_name(const BindingRef &b) const {
@@ -590,16 +843,26 @@ class CallSemantics {
     if(type.kind==T_CV)return (!c||type.is_const) && (!v||type.is_volatile);
     return !c&&!v;
   }
-  static CType add_cv(const CType &type,bool c,bool v) {
+  CType add_cv(const CType &type,bool c,bool v) const {
     if(!c&&!v)return type;
     if(type.kind==T_CV) {
-      CType copy=type;copy.is_const=copy.is_const||c;copy.is_volatile=copy.is_volatile||v;return copy;
+      CType copy=type;
+      const bool new_const=copy.is_const||c,new_volatile=copy.is_volatile||v;
+      if(new_const!=copy.is_const||new_volatile!=copy.is_volatile)copy.canonical_id=-1;
+      copy.is_const=new_const;copy.is_volatile=new_volatile;return copy;
     }
     CType out=derived(T_CV,type);out.is_const=c;out.is_volatile=v;return out;
   }
   static CType promote(CType t) {
     t=unqualified(t);
-    if(t.kind==T_ENUM)return builtin("int");
+    if(t.kind==T_ENUM) {
+      if(t.scoped)return t;
+      if(t.enum_underlying) {
+        CType underlying=unqualified(*t.enum_underlying);
+        return integer_rank(underlying)<3?builtin("int"):underlying;
+      }
+      return builtin("int");
+    }
     if(t.kind!=T_BUILTIN)return t;
     if(t.name=="bool" || t.name=="char" || t.name=="signed char" ||
        t.name=="unsigned char" || t.name=="short int" || t.name=="unsigned short int" ||
@@ -688,25 +951,33 @@ class CallSemantics {
     CType from=source.type;
     if(to.kind==T_LREF || to.kind==T_RREF) {
       const bool lref=to.kind==T_LREF;
+      const int ref_kind=lref?1:2;
       CType referent=to.base?*to.base:CType();
       CType src=expression_type(from);
       const bool direct_category=lref ? source.category=="lvalue" : source.category!="lvalue";
       if(direct_category) {
-        if(type_equal(src,referent))return Conversion(true,0);
-        if(qualification_convert(src,referent))return Conversion(true,1);
+        if(type_equal(src,referent))
+          return Conversion(true,0,true,ref_kind,0,true,source.category!="lvalue");
+        if(qualification_convert(src,referent))
+          return Conversion(true,0,true,ref_kind,1,true,source.category!="lvalue");
         if(unqualified(src).kind==T_CLASS&&unqualified(referent).kind==T_CLASS&&derived_from(src,referent)) {
           bool source_const=src.kind==T_CV&&src.is_const,source_volatile=src.kind==T_CV&&src.is_volatile;
           bool target_const=referent.kind==T_CV&&referent.is_const,target_volatile=referent.kind==T_CV&&referent.is_volatile;
           if((source_const&&!target_const)||(source_volatile&&!target_volatile))return Conversion();
-          return Conversion(true,(target_const&&!source_const)||(target_volatile&&!source_volatile)?2:1);
+          return Conversion(true,3,true,ref_kind,(target_const&&!source_const)||(target_volatile&&!source_volatile)?1:0,true,source.category!="lvalue");
         }
-        if(src.kind==T_POINTER&&referent.kind==T_POINTER&&src.base&&referent.base&&qualification_convert(src,referent))return Conversion(true,1);
+        if(src.kind==T_POINTER&&referent.kind==T_POINTER&&src.base&&referent.base&&qualification_convert(src,referent))
+          return Conversion(true,0,true,ref_kind,1,true,source.category!="lvalue");
       }
       if(has_cv(referent,true,false)) {
         ExprInfo materialized=source;materialized.type=src;materialized.category="prvalue";materialized.functions.clear();
         Conversion c=conversion(materialized,unqualified(referent));
-        if(c.viable && !(!lref&&source.category=="lvalue"&&c.rank==0))
-          return Conversion(true,c.rank+(lref?2:1));
+        if(c.viable && !(!lref&&source.category=="lvalue"&&c.rank==0)) {
+          const bool direct_temporary=source.category!="lvalue" && c.rank==0 &&
+              type_equal(unqualified(src),unqualified(referent));
+          return Conversion(true,c.rank,true,ref_kind,c.qualification_steps,
+                            direct_temporary,true);
+        }
       }
       return Conversion();
     }
@@ -725,29 +996,48 @@ class CallSemantics {
     }
     if(is_integral(from)&&is_integral(to)) {
       CType p=promote(from);
-      if(type_equal(p,to))return Conversion(true,1);
-      return Conversion(true,2);
+      if(type_equal(p,to))return Conversion(true,2);
+      return Conversion(true,3);
     }
-    if(is_arithmetic(from)&&is_arithmetic(to))return Conversion(true,2);
+    if(is_arithmetic(from)&&is_arithmetic(to))return Conversion(true,3);
     if(from.kind==T_POINTER && to.kind==T_POINTER && from.base&&to.base) {
       if(qualification_convert(from,to))return Conversion(true,1);
       CType fb=unqualified(*from.base),tb=unqualified(*to.base);
       if(tb.kind==T_BUILTIN && tb.name=="void" && fb.kind!=T_FUNCTION) {
         bool sc=from.base->kind==T_CV&&from.base->is_const, sv=from.base->kind==T_CV&&from.base->is_volatile;
         bool tc=to.base->kind==T_CV&&to.base->is_const, tv=to.base->kind==T_CV&&to.base->is_volatile;
-        if((!sc||tc)&&(!sv||tv))return Conversion(true,1);
+        if((!sc||tc)&&(!sv||tv))return Conversion(true,3);
       }
       if(fb.kind==T_CLASS && tb.kind==T_CLASS && derived_from(fb,tb)) {
         bool sc=from.base->kind==T_CV&&from.base->is_const, sv=from.base->kind==T_CV&&from.base->is_volatile;
         bool tc=to.base->kind==T_CV&&to.base->is_const, tv=to.base->kind==T_CV&&to.base->is_volatile;
-        if((!sc||tc)&&(!sv||tv))return Conversion(true,(tc&&!sc)||(tv&&!sv)?2:1);
+        if((!sc||tc)&&(!sv||tv))return Conversion(true,3,false,0,(tc&&!sc)||(tv&&!sv)?1:0);
       }
     }
-    if(from.kind==T_POINTER && to.kind==T_BUILTIN && to.name=="bool")return Conversion(true,2);
-    if(source.null_pointer_constant && to.kind==T_POINTER)return Conversion(true,1);
-    if(source.null_pointer_constant && to.kind==T_BUILTIN&&to.name=="nullptr_t")return Conversion(true,2);
-    if(from.kind==T_BUILTIN && from.name=="nullptr_t" && to.kind==T_POINTER)return Conversion(true,2);
+    if(from.kind==T_POINTER && to.kind==T_BUILTIN && to.name=="bool")
+      return Conversion(true,3,false,0,1);
+    if(source.null_pointer_constant && to.kind==T_POINTER)return Conversion(true,3);
+    if(source.null_pointer_constant && to.kind==T_BUILTIN&&to.name=="nullptr_t")return Conversion(true,3);
+    if(from.kind==T_BUILTIN && from.name=="nullptr_t" && to.kind==T_POINTER)return Conversion(true,3);
     return Conversion();
+  }
+  static bool better_conversion(const Conversion &a,const Conversion &b,
+                                const ExprInfo &source) {
+    if(a.rank!=b.rank)return a.rank<b.rank;
+    if(a.reference_binding && b.reference_binding) {
+      if(a.direct_reference_binding!=b.direct_reference_binding)
+        return a.direct_reference_binding;
+      if(a.reference_kind!=b.reference_kind && a.binds_rvalue && b.binds_rvalue)
+        return a.reference_kind==2;
+      if(a.qualification_steps!=b.qualification_steps)
+        return a.qualification_steps<b.qualification_steps;
+    } else if(!a.reference_binding && !b.reference_binding &&
+              a.qualification_steps!=b.qualification_steps) {
+      return a.qualification_steps<b.qualification_steps;
+    }
+    // A by-value lvalue transformation and a reference binding can both be
+    // exact-match sequences; neither wins merely because one is a reference.
+    return false;
   }
   bool scalar_condition(const ExprInfo &e) const {
     CType t=unqualified(expression_type(e.type));
@@ -758,40 +1048,59 @@ class CallSemantics {
     if(name.empty())return std::vector<BindingRef>();
     return function_set(name,scope);
   }
-  ExprInfo expression(const Node &node,int scope,unsigned depth,
-                      const CType *expected,std::ostream *out) {
-    const std::string &text=node.text;
+  ExprInfo literal_expression(const Node &node,unsigned depth,
+                              const CType *expected,std::ostream *out) {
     ExprInfo e;
-    if(text.compare(0,std::string("literal ").size(),"literal ")==0) {
       const std::string tok=literal_token(node);
       CType type;
       bool string_lit=tok.find('"')!=std::string::npos;
       if(string_lit) {
-        std::size_t opening=std::string::npos,closing=std::string::npos;
-        for(std::size_t i=0;i<tok.size();++i)if(tok[i]=='"' && (i==0||tok[i-1]!='\\')){if(opening==std::string::npos)opening=i;else {closing=i;break;}}
-        if(opening==std::string::npos)opening=0;
-        if(closing==std::string::npos)closing=tok.size();
-        unsigned long long n=static_cast<unsigned long long>(closing-opening);
-        if(tok.compare(0,2,"R\"")==0) {
-          std::size_t paren=tok.find('('), end=tok.find(')',paren==std::string::npos?0:paren+1);
-          if(paren!=std::string::npos&&end!=std::string::npos)n=static_cast<unsigned long long>(end-paren);
+        const std::size_t opening=tok.find('"');
+        if(opening==std::string::npos)throw std::runtime_error("malformed string literal");
+        const std::string prefix=tok.substr(0,opening);
+        const bool raw=prefix.find('R')!=std::string::npos;
+        std::size_t begin=opening+1,finish=tok.size();
+        if(raw) {
+          const std::size_t paren=tok.find('(',opening+1);
+          if(paren==std::string::npos)throw std::runtime_error("malformed raw string literal");
+          const std::string delimiter=tok.substr(opening+1,paren-opening-1);
+          const std::string close=")"+delimiter+"\"";
+          const std::size_t end=tok.rfind(close);
+          if(end==std::string::npos || end<paren)throw std::runtime_error("malformed raw string literal");
+          begin=paren+1;finish=end;
+        } else {
+          if(tok.size()<=opening+1||tok[tok.size()-1]!='"')throw std::runtime_error("malformed string literal");
+          finish=tok.size()-1;
         }
-        type=derived(T_ARRAY,add_cv(builtin("char"),true,false));type.bound=n;
+        std::string element="char";
+        if(prefix.find('L')!=std::string::npos)element="wchar_t";
+        else if(prefix.find('U')!=std::string::npos)element="char32_t";
+        else if(prefix.find('u')!=std::string::npos&&prefix.find("u8")==std::string::npos)element="char16_t";
+        type=derived(T_ARRAY,add_cv(builtin(element),true,false));
+        type.bound=string_literal_units(tok,begin,finish,prefix,raw);
         e.category="lvalue";
-      } else if(std::isdigit(static_cast<unsigned char>(tok[0])) &&
-                (tok.find('.')!=std::string::npos || tok.find_first_of("pP")!=std::string::npos ||
-                 (tok.compare(0,2,"0x")!=0&&tok.compare(0,2,"0X")!=0&&tok.find_first_of("eE")!=std::string::npos))) {
+      } else if(tok.find('.')!=std::string::npos || tok.find_first_of("pP")!=std::string::npos ||
+                ((tok.compare(0,2,"0x")!=0&&tok.compare(0,2,"0X")!=0) &&
+                 tok.find_first_of("eE")!=std::string::npos)) {
         type=builtin(tok.size() && (tok[tok.size()-1]=='f'||tok[tok.size()-1]=='F')?"float":
                      tok.size() && (tok[tok.size()-1]=='l'||tok[tok.size()-1]=='L')?"long double":"double");
       } else if(!tok.empty() && (tok[0]=='\'' || tok.compare(0,2,"L'")==0 || tok.compare(0,2,"u'")==0 || tok.compare(0,2,"U'")==0)) {
-        type=builtin("int");
-        std::size_t q=tok.find('\'');
-        if(q!=std::string::npos && q+1<tok.size()) {
-          long long v=tok[q+1]=='\\' && q+2<tok.size() ? static_cast<unsigned char>(tok[q+2]) : static_cast<unsigned char>(tok[q+1]);
-          e.has_constant=true;e.constant=v;
+        const std::size_t opening=tok.find('\''),closing=tok.rfind('\'');
+        if(opening==std::string::npos||closing<=opening)throw std::runtime_error("malformed character literal");
+        const std::size_t begin=opening+1;
+        const std::size_t chars=literal_character_count(tok,begin,closing);
+        std::string character_type="int";
+        if(tok.compare(0,2,"L'")==0)character_type="wchar_t";
+        else if(tok.compare(0,2,"u'")==0)character_type="char16_t";
+        else if(tok.compare(0,2,"U'")==0)character_type="char32_t";
+        else if(chars==1)character_type="char";
+        type=builtin(character_type);
+        unsigned long long value=decode_character_value(tok,begin,closing);
+        if(value<=static_cast<unsigned long long>(LLONG_MAX)) {
+          e.has_constant=true;e.constant=static_cast<long long>(value);
         }
       } else {
-        bool uns=false;int longs=0;
+        bool uns=false;unsigned longs=0;
         for(std::size_t i=tok.size();i>0;--i) {
           char c=tok[i-1];if(c=='u'||c=='U')uns=true;else if(c=='l'||c=='L')++longs;else break;
         }
@@ -799,9 +1108,7 @@ class CallSemantics {
         while(!digits.empty() && (digits[digits.size()-1]=='u'||digits[digits.size()-1]=='U'||digits[digits.size()-1]=='l'||digits[digits.size()-1]=='L'))digits.erase(digits.size()-1);
         errno=0;char *end=0;unsigned long long v=digits.empty()?0:std::strtoull(digits.c_str(),&end,0);
         if(digits.empty()||errno||end!=digits.c_str()+digits.size())throw std::runtime_error("invalid integer literal");
-        if(longs>=2)type=builtin(uns?"unsigned long long int":"long long int");
-        else if(longs==1)type=builtin(uns?"unsigned long int":"long int");
-        else type=builtin(uns?"unsigned int":"int");
+        type=builtin(integer_literal_type(digits,uns,longs,v));
         if(v<=static_cast<unsigned long long>(LLONG_MAX)){e.has_constant=true;e.constant=static_cast<long long>(v);}
         e.null_pointer_constant=(v==0 && tok.size() && std::isdigit(static_cast<unsigned char>(tok[0])));
       }
@@ -812,7 +1119,13 @@ class CallSemantics {
               (expected->kind==T_CV))e.type=*expected;
       if(out)*out<<indent(depth)<<"literal "<<e.category<<" "<<format_type(e.type)<<" "<<tok<<"\n";
       return e;
-    }
+  }
+  ExprInfo expression(const Node &node,int scope,unsigned depth,
+                      const CType *expected,std::ostream *out) {
+    const std::string &text=node.text;
+    ExprInfo e;
+    if(text.compare(0,std::string("literal ").size(),"literal ")==0)
+      return literal_expression(node,depth,expected,out);
     if(text.compare(0,std::string("keyword-literal ").size(),"keyword-literal ")==0) {
       std::string token=after(text,"keyword-literal ");
       std::string raw=token;
@@ -847,6 +1160,7 @@ class CallSemantics {
               if(first.kind==T_POINTER&&first.base &&
                  first.base->name.find(member_owner.name)!=std::string::npos) {
                 fn.params.erase(fn.params.begin());
+                fn.canonical_id=-1;
               }
             }
             if(type_equal(fn,target)){chosen=funcs[i];chosen_type=fn;break;}
@@ -864,6 +1178,7 @@ class CallSemantics {
         if(resolved_member_target&&e.type.kind==T_FUNCTION) {
           e.type.is_const=selected_member_function.is_const;
           e.type.is_volatile=selected_member_function.is_volatile;
+          e.type.canonical_id=-1;
         }
         if(chosen.value.entity>=0)e.type=function_with_implicit_object(e.type,model_.entity(chosen.value.entity).owner_scope);
         e.category="lvalue";e.functions=funcs;
@@ -973,7 +1288,7 @@ class CallSemantics {
       if(node.children.size()!=1)throw std::runtime_error("sizeof operand missing");
       CType operand;
       if(node.children[0].text=="type-id")operand=from_type_id(model_.type_from_syntax(node.children[0],scope));
-      else operand=expression(node.children[0],scope,0,0,0).type;
+      else operand=expression_type(expression(node.children[0],scope,0,0,0).type);
       unsigned long long size=sizeof_type(operand);
       e.type=builtin("unsigned long int");e.has_constant=true;e.constant=static_cast<long long>(size);
       if(out)*out<<indent(depth)<<"sizeof-expression prvalue unsigned long int\n";
@@ -1010,6 +1325,7 @@ class CallSemantics {
       }
     }
     BindingRef b=lookup(name,owner);
+    if(b.valid() && b.scope!=owner)b=BindingRef();
     if(!b.valid() && qualifier.empty()) {
       std::vector<int> work,seen;
       SemanticScopeInfo initial=model_.scope(owner);
@@ -1037,19 +1353,42 @@ class CallSemantics {
   }
   unsigned long long sizeof_type(CType t) const {
     if(t.kind==T_CV&&t.base)return sizeof_type(*t.base);
-    if(t.kind==T_LREF||t.kind==T_RREF||t.kind==T_POINTER)return 8;
-    if(t.kind==T_ARRAY&&t.base)return t.bound*sizeof_type(*t.base);
-    if(t.kind==T_ENUM)return 4;
-    if(t.kind==T_CLASS) {
-      if(t.owner>=0){SemanticScopeInfo s=model_.scope(t.owner);if(s.layout_complete&&s.object_size>0)return static_cast<unsigned long long>(s.object_size);}
-      return 1;
+    if(t.kind==T_LREF||t.kind==T_RREF) {
+      if(!t.base)throw std::runtime_error("invalid reference type in sizeof");
+      return sizeof_type(*t.base);
     }
+    if(t.kind==T_POINTER)return 8;
+    if(t.kind==T_MEMBER_POINTER) {
+      if(!t.base)throw std::runtime_error("invalid member pointer type in sizeof");
+      return t.base->kind==T_FUNCTION?16:8;
+    }
+    if(t.kind==T_ARRAY) {
+      if(!t.base||t.bound==0)throw std::runtime_error("sizeof incomplete array type");
+      const unsigned long long element=sizeof_type(*t.base);
+      if(element && t.bound>std::numeric_limits<unsigned long long>::max()/element)
+        throw std::runtime_error("array size overflows target size type");
+      return t.bound*element;
+    }
+    if(t.kind==T_ENUM) {
+      if(t.enum_underlying)return sizeof_type(*t.enum_underlying);
+      return 4;
+    }
+    if(t.kind==T_CLASS) {
+      if(t.owner>=0) {
+        SemanticScopeInfo s=model_.scope(t.owner);
+        if(s.layout_complete)return static_cast<unsigned long long>(s.object_size>0?s.object_size:1);
+      }
+      throw std::runtime_error("sizeof incomplete class type");
+    }
+    if(t.kind==T_FUNCTION || (t.kind==T_BUILTIN&&(t.name=="void"||t.name.empty())))
+      throw std::runtime_error("sizeof applied to non-object type");
     if(t.name=="bool"||t.name=="char"||t.name=="signed char"||t.name=="unsigned char")return 1;
     if(t.name=="short int"||t.name=="unsigned short int"||t.name=="char16_t")return 2;
-    if(t.name=="long int"||t.name=="unsigned long int"||t.name=="long long int"||t.name=="unsigned long long int"||t.name=="double")return 8;
+    if(t.name=="long int"||t.name=="unsigned long int"||t.name=="long long int"||
+       t.name=="unsigned long long int"||t.name=="double"||t.name=="nullptr_t")return 8;
     if(t.name=="long double")return 16;
-    if(t.name=="void"||t.kind==T_FUNCTION)return 1;
-    return 4;
+    if(t.name=="float"||t.name=="int"||t.name=="unsigned int"||t.name=="wchar_t"||t.name=="char32_t")return 4;
+    throw std::runtime_error("sizeof unsupported type");
   }
   static bool constant_truth(const ExprInfo &e) { return e.has_constant&&e.constant!=0; }
   ExprInfo unary(const Node &node,int scope,unsigned depth,const CType *expected,std::ostream *out) {
@@ -1058,7 +1397,7 @@ class CallSemantics {
     std::string op=after(node.text,postfix?"postfix-expression ":"unary-expression ");
     const CType *operand_target=0;
     if(expected && op.find("OP_AMP:&")!=std::string::npos) {
-      if(expected->kind==T_POINTER&&expected->base)operand_target=expected->base.get();
+      if(expected->kind==T_POINTER&&expected->base)operand_target=expected->base;
       else if(expected->kind==T_MEMBER_POINTER)operand_target=expected;
     }
     ExprInfo a=expression(node.children[0],scope,depth+1,operand_target,0);
@@ -1338,7 +1677,7 @@ class CallSemantics {
       if(out){*out<<indent(depth)<<"call-expression "<<e.category<<" "<<format_type(e.type)<<"\n";expression(callee,scope,depth+1,0,out);for(std::size_t i=0;i<arguments.size();++i)emit_call_argument(*arguments[i],scope,depth+1,i<f.params.size()?&f.params[i]:0,out);}
       return e;
     }
-    struct Viable { BindingRef fn; CType type; std::vector<int> ranks; };
+    struct Viable { BindingRef fn; CType type; std::vector<Conversion> ranks; };
     std::vector<ExprInfo> actual_arguments;
     for(std::size_t i=0;i<arguments.size();++i)actual_arguments.push_back(expression(*arguments[i],scope,0,0,0));
     std::vector<Viable> viable;
@@ -1351,8 +1690,8 @@ class CallSemantics {
         ExprInfo arg=actual_arguments[j];
         if(j<f.params.size()) {
           Conversion c=conversion(arg,f.params[j]);
-          if(!c.viable){ok=false;break;}v.ranks.push_back(c.rank);
-        } else v.ranks.push_back(4);
+          if(!c.viable){ok=false;break;}v.ranks.push_back(c);
+        } else v.ranks.push_back(Conversion(true,4));
       }
       if(ok)viable.push_back(v);
     }
@@ -1365,8 +1704,11 @@ class CallSemantics {
       for(std::size_t j=0;j<viable.size()&&!dominated;++j)if(i!=j) {
         bool no_worse=true,better=false;
         for(std::size_t k=0;k<viable[i].ranks.size();++k) {
-          if(viable[j].ranks[k]>viable[i].ranks[k])no_worse=false;
-          if(viable[j].ranks[k]<viable[i].ranks[k])better=true;
+          const ExprInfo &actual=actual_arguments[k];
+          if(better_conversion(viable[i].ranks[k],viable[j].ranks[k],actual))
+            no_worse=false;
+          if(better_conversion(viable[j].ranks[k],viable[i].ranks[k],actual))
+            better=true;
         }
         if(no_worse&&better)dominated=true;
       }
@@ -1450,7 +1792,7 @@ class CallSemantics {
         if(value.children.size()>arr.bound)throw std::runtime_error("too many array initializers");
         if(out)*out<<indent(depth)<<"braced-init-list lvalue "<<format_type(target)<<"\n";
         for(std::size_t i=0;i<value.children.size();++i) {
-          ExprInfo x=expression(value.children[i],scope,depth+1,arr.base.get(),out);
+          ExprInfo x=expression(value.children[i],scope,depth+1,arr.base,out);
           if(!conversion(x,*arr.base).viable)throw std::runtime_error("invalid array element initializer");
         }
       } else {
@@ -1481,7 +1823,7 @@ class CallSemantics {
     if(!recorded)demanded_constructors_.push_back(cls);
     std::string name=class_short_name(cls);
     CType this_pointer=derived(T_POINTER,cls);
-    CType ctor;ctor.kind=T_FUNCTION;ctor.name="";ctor.base.reset(new CType(builtin("void")));ctor.params.push_back(this_pointer);
+    CType ctor;ctor.kind=T_FUNCTION;ctor.name="";ctor.base=store_type(builtin("void"));ctor.params.push_back(this_pointer);
     out<<indent(depth)<<"constructor-action "<<name<<"::"<<name<<"\n";
     out<<indent(depth+1)<<"call-expression prvalue void\n";
     out<<indent(depth+2)<<"callee "<<name<<"::"<<name<<" "<<format_type(ctor)<<"\n";
@@ -1493,7 +1835,7 @@ class CallSemantics {
       const CType &cls=demanded_constructors_[i];
       std::string name=class_short_name(cls);
       CType this_pointer=derived(T_POINTER,cls);
-      CType fn;fn.kind=T_FUNCTION;fn.base.reset(new CType(builtin("void")));fn.params.push_back(this_pointer);
+      CType fn;fn.kind=T_FUNCTION;fn.base=store_type(builtin("void"));fn.params.push_back(this_pointer);
       out<<"  function-definition "<<name<<"::"<<name<<" "<<format_type(fn)<<"\n";
       out<<"    parameter this "<<format_type(this_pointer)<<"\n";
       out<<"    compound-statement\n";
@@ -1683,6 +2025,42 @@ class CallSemantics {
     }
     if(node.text=="translation-unit")for(std::size_t i=0;i<node.children.size();++i)top_declaration(node.children[i],scope,depth,out);
   }
+  unsigned long long converted_case_value(long long value,CType target) const {
+    target=unqualified(target);
+    if(target.kind==T_ENUM&&target.enum_underlying)
+      target=unqualified(*target.enum_underlying);
+    if(target.kind==T_BUILTIN&&unsigned_type(target)) {
+      if(target.name=="unsigned int")return static_cast<unsigned int>(value);
+      if(target.name=="unsigned long int")return static_cast<unsigned long>(value);
+      if(target.name=="unsigned long long int")return static_cast<unsigned long long>(value);
+      if(target.name=="unsigned short int")return static_cast<unsigned short>(value);
+      if(target.name=="unsigned char")return static_cast<unsigned char>(value);
+    }
+    return static_cast<unsigned long long>(value);
+  }
+  ExprInfo switch_condition(const Node &node,int scope,unsigned depth,
+                            std::ostream &out) {
+    ExprInfo result;
+    out<<indent(depth)<<"condition\n";
+    if(node.children.empty())return result;
+    const Node &value=node.children[0];
+    if(value.text=="condition-declaration") {
+      std::string name;
+      for(std::size_t i=0;i<value.children.size();++i)
+        if(value.children[i].text=="declarator")name=decl_name(value.children[i]);
+      BindingRef binding=lookup(name,scope);
+      if(!binding.valid())throw std::runtime_error("switch condition declaration binding missing");
+      result.type=from_type_id(binding.value.type);
+      out<<indent(depth+1)<<"condition-declaration\n";
+      out<<indent(depth+2)<<"variable "<<name<<" "<<format_type(result.type)<<"\n";
+      const Node *init=child(value,"initializer");
+      if(init)emit_initialization(*init,scope,unqualified(result.type),depth+3,&out);
+    } else result=expression(value,scope,depth+1,0,&out);
+    CType type=unqualified(expression_type(result.type));
+    if(!is_integral(type)&&type.kind!=T_ENUM)
+      throw std::runtime_error("switch condition is not integral or enum");
+    return result;
+  }
   void condition(const Node &node,int scope,unsigned depth,std::ostream &out,const CType &ret) {
     out<<indent(depth)<<"condition\n";
     if(node.children.empty())return;
@@ -1706,6 +2084,10 @@ class CallSemantics {
   }
   void statement(const Node &node,int scope,unsigned depth,std::ostream &out,const CType &return_type) {
     const std::string &text=node.text;
+    if(text!="compound-statement") {
+      int implicit_scope=scope_at(node,SEMANTIC_BLOCK_SCOPE,scope);
+      if(implicit_scope>=0)scope=implicit_scope;
+    }
     if(text=="compound-statement") {
       int block=scope_at(node,SEMANTIC_BLOCK_SCOPE,scope);
       if(block<0)block=scope_at(node,SEMANTIC_BLOCK_SCOPE);
@@ -1756,20 +2138,25 @@ class CallSemantics {
     }
     if(text=="while-statement"||text=="switch-statement") {
       out<<indent(depth)<<text<<"\n";
+      CType switch_type;
       if(!node.children.empty()) {
         if(text=="switch-statement") {
-          const Node &cn=node.children[0];
-          out<<indent(depth+1)<<"condition\n";
-          if(!cn.children.empty()) {
-            ExprInfo sw=expression(cn.children[0],scope,depth+2,0,&out);
-            CType st=unqualified(expression_type(sw.type));
-            if(!is_integral(st)&&st.kind!=T_ENUM)throw std::runtime_error("switch condition is not integral or enum");
-          }
+          ExprInfo sw=switch_condition(node.children[0],scope,depth+1,out);
+          switch_type=unqualified(expression_type(sw.type));
+          if(switch_type.kind==T_ENUM&&!switch_type.scoped)switch_type=promote(switch_type);
+          else if(switch_type.kind!=T_ENUM)switch_type=promote(switch_type);
         } else condition(node.children[0],scope,depth+1,out,return_type);
       }
-      if(text=="switch-statement")++switch_depth_;else ++loop_depth_;
+      if(text=="switch-statement") {
+        ++switch_depth_;
+        SwitchFrame frame;frame.condition_type=switch_type;
+        switch_frames_.push_back(frame);
+      } else ++loop_depth_;
       if(node.children.size()>1)statement(node.children[1],scope,depth+1,out,return_type);
-      if(text=="switch-statement")--switch_depth_;else --loop_depth_;
+      if(text=="switch-statement") {
+        --switch_depth_;
+        switch_frames_.pop_back();
+      } else --loop_depth_;
       return;
     }
     if(text=="do-statement") {
@@ -1808,11 +2195,18 @@ class CallSemantics {
       out<<indent(depth)<<"case-statement\n";
       ExprInfo e=expression(node.children[0],scope,depth+1,0,&out);
       if(!e.has_constant||(!is_integral(e.type)&&unqualified(e.type).kind!=T_ENUM))throw std::runtime_error("case label is not integral constant");
+      if(switch_frames_.empty() ||
+         !switch_frames_.back().labels.insert(converted_case_value(
+             e.constant,switch_frames_.back().condition_type)).second)
+        throw std::runtime_error("duplicate case label");
       statement(node.children[1],scope,depth+1,out,return_type);
       return;
     }
     if(text=="default-statement") {
       if(!switch_depth_)throw std::runtime_error("default outside switch");
+      if(switch_frames_.empty() || switch_frames_.back().has_default)
+        throw std::runtime_error("duplicate default label");
+      switch_frames_.back().has_default=true;
       out<<indent(depth)<<"default-statement\n";
       if(!node.children.empty())statement(node.children[0],scope,depth+1,out,return_type);
       return;
@@ -1912,7 +2306,11 @@ public:
     }
     for(std::size_t i=0;i<node.children.size();++i)emit_inline_class_members(node.children[i],scope,depth,out);
   }
-  CallSemantics(SemanticModel &model):model_(model),root_(model.syntax_root()),global_(global_scope()),anonymous_class_serial_(0),anonymous_enum_serial_(0),loop_depth_(0),switch_depth_(0){build_semantic_indexes();}
+  CallSemantics(SemanticModel &model):model_(model),root_(model.syntax_root()),global_(global_scope()),anonymous_class_serial_(0),anonymous_enum_serial_(0),loop_depth_(0),switch_depth_(0){
+    canonical_type_cache_.resize(model_.type_count());
+    canonical_type_cached_.resize(model_.type_count(),0);
+    build_semantic_indexes();
+  }
   void validate_declarations(const Node &node,std::map<int,int> &definitions) {
     if(node.text=="function-definition") {
       int fn=scope_at(node,SEMANTIC_FUNCTION_SCOPE);
