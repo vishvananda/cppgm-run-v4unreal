@@ -567,33 +567,48 @@ string HexDump(const void* pdata, size_t nbytes)
 // DebugPostTokenOutputStream: helper class to produce PA2 output format
 struct DebugPostTokenOutputStream
 {
-  explicit DebugPostTokenOutputStream(std::ostream & output, bool * invalid)
-    : output_(output), saw_invalid_(invalid) { pending_.reserve(65536); }
-  std::ostream & output_;
+  explicit DebugPostTokenOutputStream(std::ostream * output, bool * invalid,
+                                      vector<PostTokenRecord> * records = 0)
+    : output_(output), saw_invalid_(invalid), records_(records)
+    { pending_.reserve(65536); }
+  std::ostream * output_;
   bool * saw_invalid_;
+  vector<PostTokenRecord> * records_;
+  void record(const string & kind, const string & source)
+    { if (records_) records_->push_back(PostTokenRecord(kind, source)); }
 
   void emit_invalid(const string& source)
   {
     if (saw_invalid_) *saw_invalid_ = true;
+    record("invalid", source);
+    if (!output_) return;
     pending_.append("invalid "); pending_.append(source); finish_record();
   }
   void emit_simple(const string& source, ETokenType token_type)
   {
+    record("simple", source);
+    if (!output_) return;
     pending_.append("simple "); pending_.append(source); pending_.push_back(' ');
     pending_.append(TokenTypeToStringMap.at(token_type)); finish_record();
   }
   void emit_identifier(const string& source)
   {
+    record("identifier", source);
+    if (!output_) return;
     pending_.append("identifier "); pending_.append(source); finish_record();
   }
   void emit_literal(const string& source, EFundamentalType type, const void* data, size_t nbytes)
   {
+    record("literal", source);
+    if (!output_) return;
     pending_.append("literal "); pending_.append(source); pending_.push_back(' ');
     pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
     pending_.append(HexDump(data, nbytes)); finish_record();
   }
   void emit_literal_array(const string& source, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
   {
+    record("literal", source);
+    if (!output_) return;
     pending_.append("literal "); pending_.append(source); pending_.append(" array of ");
     pending_.append(std::to_string(num_elements)); pending_.push_back(' ');
     pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
@@ -601,6 +616,8 @@ struct DebugPostTokenOutputStream
   }
   void emit_user_defined_literal_character(const string& source, const string& ud_suffix, EFundamentalType type, const void* data, size_t nbytes)
   {
+    record("user-defined-literal", source);
+    if (!output_) return;
     pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
     pending_.append(ud_suffix); pending_.append(" character ");
     pending_.append(FundamentalTypeToStringMap.at(type)); pending_.push_back(' ');
@@ -608,6 +625,8 @@ struct DebugPostTokenOutputStream
   }
   void emit_user_defined_literal_string_array(const string& source, const string& ud_suffix, size_t num_elements, EFundamentalType type, const void* data, size_t nbytes)
   {
+    record("user-defined-literal", source);
+    if (!output_) return;
     pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
     pending_.append(ud_suffix); pending_.append(" string array of ");
     pending_.append(std::to_string(num_elements)); pending_.push_back(' ');
@@ -616,16 +635,22 @@ struct DebugPostTokenOutputStream
   }
   void emit_user_defined_literal_integer(const string& source, const string& ud_suffix, const string& prefix)
   {
+    record("user-defined-literal", source);
+    if (!output_) return;
     pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
     pending_.append(ud_suffix); pending_.append(" integer "); pending_.append(prefix); finish_record();
   }
   void emit_user_defined_literal_floating(const string& source, const string& ud_suffix, const string& prefix)
   {
+    record("user-defined-literal", source);
+    if (!output_) return;
     pending_.append("user-defined-literal "); pending_.append(source); pending_.push_back(' ');
     pending_.append(ud_suffix); pending_.append(" floating "); pending_.append(prefix); finish_record();
   }
   void emit_eof()
   {
+    record("eof", string());
+    if (!output_) return;
     pending_.append("eof"); finish_record(); flush();
   }
 private:
@@ -638,7 +663,7 @@ private:
   void flush()
   {
     if (pending_.empty()) return;
-    output_.write(pending_.data(), static_cast<std::streamsize>(pending_.size()));
+    if (output_) output_->write(pending_.data(), static_cast<std::streamsize>(pending_.size()));
     pending_.clear();
   }
 };
@@ -1512,7 +1537,32 @@ class PostTokenAdapter : public IPPTokenStream
 {
 public:
   PostTokenAdapter(std::ostream & output, bool * invalid)
-    : output_(output, invalid), stream_(output_) {}
+    : output_(&output, invalid), stream_(output_) {}
+  void set_source_line(std::size_t line) { (void)line; }
+  void set_source_location(std::size_t line, std::size_t column)
+    { (void)line; (void)column; }
+  void emit_whitespace_sequence() { stream_.emit_whitespace_sequence(); }
+  void emit_new_line() { stream_.emit_new_line(); }
+  void emit_header_name(const std::string & s) { stream_.emit_header_name(s); }
+  void emit_identifier(const std::string & s) { stream_.emit_identifier(s); }
+  void emit_pp_number(const std::string & s) { stream_.emit_pp_number(s); }
+  void emit_character_literal(const std::string & s) { stream_.emit_character_literal(s); }
+  void emit_user_defined_character_literal(const std::string & s) { stream_.emit_user_defined_character_literal(s); }
+  void emit_string_literal(const std::string & s) { stream_.emit_string_literal(s); }
+  void emit_user_defined_string_literal(const std::string & s) { stream_.emit_user_defined_string_literal(s); }
+  void emit_preprocessing_op_or_punc(const std::string & s) { stream_.emit_preprocessing_op_or_punc(s); }
+  void emit_non_whitespace_char(const std::string & s) { stream_.emit_non_whitespace_char(s); }
+  void emit_eof() { stream_.emit_eof(); }
+private:
+  DebugPostTokenOutputStream output_;
+  PostTokenStream stream_;
+};
+
+class PostTokenCollectorAdapter : public IPPTokenStream
+{
+public:
+  PostTokenCollectorAdapter(vector<PostTokenRecord> & records, bool * invalid)
+    : output_(0, invalid, &records), stream_(output_) {}
   void set_source_line(std::size_t line) { (void)line; }
   void set_source_location(std::size_t line, std::size_t column)
     { (void)line; (void)column; }
@@ -1538,6 +1588,12 @@ std::unique_ptr<IPPTokenStream> create_posttoken_stream(std::ostream & output,
                                                         bool * saw_invalid)
 {
   return std::unique_ptr<IPPTokenStream>(new PostTokenAdapter(output, saw_invalid));
+}
+
+std::unique_ptr<IPPTokenStream> create_posttoken_collector(
+    vector<PostTokenRecord> & records, bool * saw_invalid)
+{
+  return unique_ptr<IPPTokenStream>(new PostTokenCollectorAdapter(records, saw_invalid));
 }
 
 void run_posttoken_tool(std::istream & input, std::ostream & output)
