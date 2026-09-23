@@ -12,32 +12,74 @@
 
 namespace {
 
-enum TokenKind
-{
-  TOKEN_IDENTIFIER,
-  TOKEN_NUMBER,
-  TOKEN_CHARACTER,
-  TOKEN_OPERATOR,
-  TOKEN_INVALID
-};
-
-struct Token
-{
-  TokenKind kind;
-  std::string spelling;
-  std::string original_spelling;
-  bool identifier_spelling;
-  Token(TokenKind k, const std::string & s, bool id = false,
-        const std::string & original = std::string())
-    : kind(k), spelling(s), original_spelling(original.empty() ? s : original),
-      identifier_spelling(id) {}
-};
-
 struct Value
 {
   uint64_t bits;
   bool is_unsigned;
   Value(uint64_t b = 0, bool u = false) : bits(b), is_unsigned(u) {}
+};
+
+enum TokenKind
+{
+  TOKEN_IDENTIFIER,
+  TOKEN_VALUE,
+  TOKEN_OPERATOR,
+  TOKEN_INVALID
+};
+
+enum IdentifierKind
+{
+  IDENTIFIER_OTHER,
+  IDENTIFIER_TRUE,
+  IDENTIFIER_FALSE,
+  IDENTIFIER_DEFINED
+};
+
+enum OperatorKind
+{
+  OP_UNSUPPORTED,
+  OP_LPAREN,
+  OP_RPAREN,
+  OP_PLUS,
+  OP_MINUS,
+  OP_LNOT,
+  OP_COMPL,
+  OP_STAR,
+  OP_DIV,
+  OP_MOD,
+  OP_LSHIFT,
+  OP_RSHIFT,
+  OP_LT,
+  OP_GT,
+  OP_LE,
+  OP_GE,
+  OP_EQ,
+  OP_NE,
+  OP_AMP,
+  OP_XOR,
+  OP_BOR,
+  OP_LAND,
+  OP_LOR,
+  OP_QMARK,
+  OP_COLON
+};
+
+// Callback spellings are transient. Keep only the facts needed by the parser:
+// literal values, operator identity, and the tiny identifier facts needed by
+// true/false/defined and the PA3 mock-defined rule.
+struct Token
+{
+  TokenKind kind;
+  Value value;
+  OperatorKind op;
+  IdentifierKind identifier;
+  bool identifier_operand;
+  bool first_byte_odd;
+
+  Token(TokenKind k, const Value & v = Value(), OperatorKind operation = OP_UNSUPPORTED,
+        IdentifierKind id = IDENTIFIER_OTHER, bool operand = false, bool odd = false)
+    : kind(k), value(v), op(operation), identifier(id),
+      identifier_operand(operand), first_byte_odd(odd) {}
 };
 
 class ExpressionFailure : public std::exception
@@ -317,38 +359,50 @@ bool parse_character_literal(const std::string & text, Value * result)
 
 bool is_alternative_identifier(const std::string & s)
 {
-  // PA1 emits these two C++ keywords through the operator callback too;
-  // unlike the alternative operator names, they remain primary identifiers
-  // in the PA3 controlling-expression grammar.
+  // PA1 emits the alternative operator names and these two keywords through
+  // the operator callback. They remain identifier operands for `defined`;
+  // new/delete are converted to ordinary identifier tokens by the consumer.
   return s == "new" || s == "delete" || s == "and" || s == "or" ||
-         s == "not" || s == "bitand" ||
-         s == "bitor" || s == "xor" || s == "compl" || s == "and_eq" ||
-         s == "or_eq" || s == "xor_eq" || s == "not_eq";
+         s == "not" || s == "bitand" || s == "bitor" || s == "xor" ||
+         s == "compl" || s == "and_eq" || s == "or_eq" || s == "xor_eq" ||
+         s == "not_eq";
 }
 
-bool is_identifier_operand(const Token & token)
+OperatorKind operator_kind(const std::string & source)
 {
-  return token.identifier_spelling;
+  if (source == "(") return OP_LPAREN;
+  if (source == ")") return OP_RPAREN;
+  if (source == "+") return OP_PLUS;
+  if (source == "-") return OP_MINUS;
+  if (source == "!" || source == "not") return OP_LNOT;
+  if (source == "~" || source == "compl") return OP_COMPL;
+  if (source == "*") return OP_STAR;
+  if (source == "/") return OP_DIV;
+  if (source == "%") return OP_MOD;
+  if (source == "<<") return OP_LSHIFT;
+  if (source == ">>") return OP_RSHIFT;
+  if (source == "<") return OP_LT;
+  if (source == ">") return OP_GT;
+  if (source == "<=") return OP_LE;
+  if (source == ">=") return OP_GE;
+  if (source == "==") return OP_EQ;
+  if (source == "!=" || source == "not_eq") return OP_NE;
+  if (source == "&" || source == "bitand") return OP_AMP;
+  if (source == "^" || source == "xor") return OP_XOR;
+  if (source == "|" || source == "bitor") return OP_BOR;
+  if (source == "&&" || source == "and") return OP_LAND;
+  if (source == "||" || source == "or") return OP_LOR;
+  if (source == "?") return OP_QMARK;
+  if (source == ":") return OP_COLON;
+  return OP_UNSUPPORTED;
 }
 
-std::string canonical_operator(const std::string & source)
+IdentifierKind identifier_kind(const std::string & spelling)
 {
-  if (source == "and") return "&&";
-  if (source == "or") return "||";
-  if (source == "not") return "!";
-  if (source == "bitand") return "&";
-  if (source == "bitor") return "|";
-  if (source == "xor") return "^";
-  if (source == "compl") return "~";
-  if (source == "not_eq") return "!=";
-  if (source == "and_eq") return "&=";
-  if (source == "or_eq") return "|=";
-  if (source == "xor_eq") return "^=";
-  if (source == "<:") return "[";
-  if (source == ":>") return "]";
-  if (source == "<%") return "{";
-  if (source == "%>") return "}";
-  return source;
+  if (spelling == "true") return IDENTIFIER_TRUE;
+  if (spelling == "false") return IDENTIFIER_FALSE;
+  if (spelling == "defined") return IDENTIFIER_DEFINED;
+  return IDENTIFIER_OTHER;
 }
 
 class Parser
@@ -369,15 +423,11 @@ private:
   size_t at_;
   unsigned recursion_depth_;
 
-  const Token * peek() const
+  bool consume(const char * spelling)
   {
-    return at_ < tokens_.size() ? &tokens_[at_] : NULL;
-  }
-
-  bool consume(const char * op)
-  {
+    const OperatorKind op = operator_kind(spelling);
     if (at_ < tokens_.size() && tokens_[at_].kind == TOKEN_OPERATOR &&
-        tokens_[at_].spelling == op)
+        tokens_[at_].op == op)
     {
       ++at_;
       return true;
@@ -391,10 +441,11 @@ private:
     return tokens_[at_++];
   }
 
-  bool at_operator(const char * op) const
+  bool at_operator(const char * spelling) const
   {
+    const OperatorKind op = operator_kind(spelling);
     return at_ < tokens_.size() && tokens_[at_].kind == TOKEN_OPERATOR &&
-           tokens_[at_].spelling == op;
+           tokens_[at_].op == op;
   }
 
   void enter_recursion()
@@ -429,100 +480,84 @@ private:
     }
 
     const Token & token = take();
-    if (token.kind == TOKEN_NUMBER)
-    {
-      Value value;
-      if (!parse_integer_literal(token.spelling, &value)) throw ExpressionFailure();
-      return value;
-    }
-    if (token.kind == TOKEN_CHARACTER)
-    {
-      Value value;
-      if (!parse_character_literal(token.spelling, &value)) throw ExpressionFailure();
-      return value;
-    }
-    if (token.kind == TOKEN_OPERATOR && token.identifier_spelling &&
-        (token.original_spelling == "new" || token.original_spelling == "delete"))
-      return Value(0, false);
+    if (token.kind == TOKEN_VALUE) return token.value;
     if (token.kind == TOKEN_IDENTIFIER)
     {
-      if (token.spelling == "true") return Value(1, false);
-      if (token.spelling == "false") return Value(0, false);
-      if (token.spelling != "defined") return Value(0, false);
+      if (token.identifier == IDENTIFIER_TRUE) return Value(1, false);
+      if (token.identifier == IDENTIFIER_FALSE) return Value(0, false);
+      if (token.identifier != IDENTIFIER_DEFINED) return Value(0, false);
 
-      bool parenthesized = consume("(");
-      if (at_ >= tokens_.size() || !is_identifier_operand(tokens_[at_]))
+      const bool parenthesized = consume("(");
+      if (at_ >= tokens_.size() || !tokens_[at_].identifier_operand)
         throw ExpressionFailure();
-      const std::string identifier = tokens_[at_++].original_spelling;
+      const bool first_byte_odd = tokens_[at_++].first_byte_odd;
       if (parenthesized && !consume(")")) throw ExpressionFailure();
-      const unsigned char first = identifier.empty() ? 0 :
-        static_cast<unsigned char>(identifier[0]);
-      return Value((first & 1u) ? 1 : 0, false);
+      return Value(first_byte_odd ? 1 : 0, false);
     }
     throw ExpressionFailure();
   }
 
   Value parse_unary(bool evaluate)
   {
-    const char * unary = NULL;
-    if (at_operator("+")) unary = "+";
-    else if (at_operator("-")) unary = "-";
-    else if (at_operator("!")) unary = "!";
-    else if (at_operator("~")) unary = "~";
-    if (unary == NULL) return parse_primary(evaluate);
+    OperatorKind op = OP_UNSUPPORTED;
+    if (at_operator("+")) op = OP_PLUS;
+    else if (at_operator("-")) op = OP_MINUS;
+    else if (at_operator("!")) op = OP_LNOT;
+    else if (at_operator("~")) op = OP_COMPL;
+    if (op == OP_UNSUPPORTED) return parse_primary(evaluate);
 
-    const std::string op(unary);
     ++at_;
     enter_recursion();
     Value operand;
     try { operand = parse_unary(evaluate); }
     catch (...) { leave_recursion(); throw; }
     leave_recursion();
-    if (!evaluate) return op == "!" ? boolean(false) : operand;
-    if (op == "+") return operand;
-    if (op == "-") return Value(uint64_t(0) - operand.bits, operand.is_unsigned);
-    if (op == "~") return Value(~operand.bits, operand.is_unsigned);
+    if (!evaluate) return op == OP_LNOT ? boolean(false) : operand;
+    if (op == OP_PLUS) return operand;
+    if (op == OP_MINUS)
+      return Value(uint64_t(0) - operand.bits, operand.is_unsigned);
+    if (op == OP_COMPL) return Value(~operand.bits, operand.is_unsigned);
     return boolean(!truth(operand));
   }
 
-  Value apply(const std::string & op, const Value & lhs, const Value & rhs,
+  Value apply(OperatorKind op, const Value & lhs, const Value & rhs,
               bool evaluate)
   {
     const bool common_unsigned = lhs.is_unsigned || rhs.is_unsigned;
-    if (op == "&&" || op == "||")
+    if (op == OP_LAND || op == OP_LOR)
     {
       if (!evaluate) return boolean(false);
-      return boolean(op == "&&" ? truth(lhs) && truth(rhs)
-                                 : truth(lhs) || truth(rhs));
+      return boolean(op == OP_LAND ? truth(lhs) && truth(rhs)
+                                   : truth(lhs) || truth(rhs));
     }
-    if (op == "==" || op == "!=" || op == "<" || op == ">" ||
-        op == "<=" || op == ">=")
+    if (op == OP_EQ || op == OP_NE || op == OP_LT || op == OP_GT ||
+        op == OP_LE || op == OP_GE)
     {
       if (!evaluate) return boolean(false);
       bool result = false;
       if (common_unsigned)
       {
-        if (op == "==") result = lhs.bits == rhs.bits;
-        else if (op == "!=") result = lhs.bits != rhs.bits;
-        else if (op == "<") result = lhs.bits < rhs.bits;
-        else if (op == ">") result = lhs.bits > rhs.bits;
-        else if (op == "<=") result = lhs.bits <= rhs.bits;
+        if (op == OP_EQ) result = lhs.bits == rhs.bits;
+        else if (op == OP_NE) result = lhs.bits != rhs.bits;
+        else if (op == OP_LT) result = lhs.bits < rhs.bits;
+        else if (op == OP_GT) result = lhs.bits > rhs.bits;
+        else if (op == OP_LE) result = lhs.bits <= rhs.bits;
         else result = lhs.bits >= rhs.bits;
       }
       else
       {
         const int64_t a = signed_value(lhs.bits), b = signed_value(rhs.bits);
-        if (op == "==") result = a == b;
-        else if (op == "!=") result = a != b;
-        else if (op == "<") result = a < b;
-        else if (op == ">") result = a > b;
-        else if (op == "<=") result = a <= b;
+        if (op == OP_EQ) result = a == b;
+        else if (op == OP_NE) result = a != b;
+        else if (op == OP_LT) result = a < b;
+        else if (op == OP_GT) result = a > b;
+        else if (op == OP_LE) result = a <= b;
         else result = a >= b;
       }
       return boolean(result);
     }
 
-    if (op == "<<" || op == ">>")
+    if (op == OP_LSHIFT || op == OP_RSHIFT)
     {
       if (!evaluate) return Value(0, lhs.is_unsigned);
       uint64_t amount;
@@ -537,7 +572,7 @@ private:
         if (signed_amount < 0 || signed_amount >= 64) throw ExpressionFailure();
         amount = static_cast<uint64_t>(signed_amount);
       }
-      if (op == "<<") return Value(lhs.bits << amount, lhs.is_unsigned);
+      if (op == OP_LSHIFT) return Value(lhs.bits << amount, lhs.is_unsigned);
       if (amount == 0) return lhs;
       uint64_t shifted = lhs.bits >> amount;
       if (!lhs.is_unsigned && (lhs.bits >> 63) != 0)
@@ -545,27 +580,27 @@ private:
       return Value(shifted, lhs.is_unsigned);
     }
 
-    if (op == "/" || op == "%")
+    if (op == OP_DIV || op == OP_MOD)
     {
       if (!evaluate) return Value(0, common_unsigned);
       if (common_unsigned)
       {
         if (rhs.bits == 0) throw ExpressionFailure();
-        return Value(op == "/" ? lhs.bits / rhs.bits : lhs.bits % rhs.bits, true);
+        return Value(op == OP_DIV ? lhs.bits / rhs.bits : lhs.bits % rhs.bits, true);
       }
       const int64_t a = signed_value(lhs.bits), b = signed_value(rhs.bits);
       if (b == 0 || (a == std::numeric_limits<int64_t>::min() && b == -1))
         throw ExpressionFailure();
-      return Value(unsigned_value(op == "/" ? a / b : a % b), false);
+      return Value(unsigned_value(op == OP_DIV ? a / b : a % b), false);
     }
 
     if (!evaluate) return Value(0, common_unsigned);
-    if (op == "*") return Value(lhs.bits * rhs.bits, common_unsigned);
-    if (op == "+") return Value(lhs.bits + rhs.bits, common_unsigned);
-    if (op == "-") return Value(lhs.bits - rhs.bits, common_unsigned);
-    if (op == "&") return Value(lhs.bits & rhs.bits, common_unsigned);
-    if (op == "^") return Value(lhs.bits ^ rhs.bits, common_unsigned);
-    if (op == "|") return Value(lhs.bits | rhs.bits, common_unsigned);
+    if (op == OP_STAR) return Value(lhs.bits * rhs.bits, common_unsigned);
+    if (op == OP_PLUS) return Value(lhs.bits + rhs.bits, common_unsigned);
+    if (op == OP_MINUS) return Value(lhs.bits - rhs.bits, common_unsigned);
+    if (op == OP_AMP) return Value(lhs.bits & rhs.bits, common_unsigned);
+    if (op == OP_XOR) return Value(lhs.bits ^ rhs.bits, common_unsigned);
+    if (op == OP_BOR) return Value(lhs.bits | rhs.bits, common_unsigned);
     throw ExpressionFailure();
   }
 
@@ -574,7 +609,7 @@ private:
     Value value = parse_unary(evaluate);
     while (at_operator("*") || at_operator("/") || at_operator("%"))
     {
-      const std::string op = take().spelling;
+      const OperatorKind op = take().op;
       const Value rhs = parse_unary(evaluate);
       value = apply(op, value, rhs, evaluate);
     }
@@ -586,7 +621,7 @@ private:
     Value value = parse_multiplicative(evaluate);
     while (at_operator("+") || at_operator("-"))
     {
-      const std::string op = take().spelling;
+      const OperatorKind op = take().op;
       const Value rhs = parse_multiplicative(evaluate);
       value = apply(op, value, rhs, evaluate);
     }
@@ -598,7 +633,7 @@ private:
     Value value = parse_additive(evaluate);
     while (at_operator("<<") || at_operator(">>"))
     {
-      const std::string op = take().spelling;
+      const OperatorKind op = take().op;
       const Value rhs = parse_additive(evaluate);
       value = apply(op, value, rhs, evaluate);
     }
@@ -611,7 +646,7 @@ private:
     while (at_operator("<") || at_operator(">") || at_operator("<=") ||
            at_operator(">="))
     {
-      const std::string op = take().spelling;
+      const OperatorKind op = take().op;
       const Value rhs = parse_shift(evaluate);
       value = apply(op, value, rhs, evaluate);
     }
@@ -623,7 +658,7 @@ private:
     Value value = parse_relational(evaluate);
     while (at_operator("==") || at_operator("!="))
     {
-      const std::string op = take().spelling;
+      const OperatorKind op = take().op;
       const Value rhs = parse_relational(evaluate);
       value = apply(op, value, rhs, evaluate);
     }
@@ -636,7 +671,7 @@ private:
     while (consume("&"))
     {
       const Value rhs = parse_equality(evaluate);
-      value = apply("&", value, rhs, evaluate);
+      value = apply(OP_AMP, value, rhs, evaluate);
     }
     return value;
   }
@@ -647,7 +682,7 @@ private:
     while (consume("^"))
     {
       const Value rhs = parse_and(evaluate);
-      value = apply("^", value, rhs, evaluate);
+      value = apply(OP_XOR, value, rhs, evaluate);
     }
     return value;
   }
@@ -658,7 +693,7 @@ private:
     while (consume("|"))
     {
       const Value rhs = parse_xor(evaluate);
-      value = apply("|", value, rhs, evaluate);
+      value = apply(OP_BOR, value, rhs, evaluate);
     }
     return value;
   }
@@ -670,7 +705,7 @@ private:
     {
       const bool evaluate_rhs = evaluate && truth(value);
       const Value rhs = parse_or(evaluate_rhs);
-      value = apply("&&", value, rhs, evaluate);
+      value = apply(OP_LAND, value, rhs, evaluate);
     }
     return value;
   }
@@ -682,7 +717,7 @@ private:
     {
       const bool evaluate_rhs = evaluate && !truth(value);
       const Value rhs = parse_logical_and(evaluate_rhs);
-      value = apply("||", value, rhs, evaluate);
+      value = apply(OP_LOR, value, rhs, evaluate);
     }
     return value;
   }
@@ -735,18 +770,45 @@ public:
 
   void emit_whitespace_sequence() {}
   void emit_new_line() { finish_line(); }
-  void emit_header_name(const std::string & data) { add(TOKEN_INVALID, data); }
-  void emit_identifier(const std::string & data) { add(TOKEN_IDENTIFIER, data, true); }
-  void emit_pp_number(const std::string & data) { add(TOKEN_NUMBER, data); }
-  void emit_character_literal(const std::string & data) { add(TOKEN_CHARACTER, data); }
-  void emit_user_defined_character_literal(const std::string & data)
-    { add(TOKEN_INVALID, data); }
-  void emit_string_literal(const std::string & data) { add(TOKEN_INVALID, data); }
-  void emit_user_defined_string_literal(const std::string & data)
-    { add(TOKEN_INVALID, data); }
+  void emit_header_name(const std::string &) { add_invalid(); }
+  void emit_identifier(const std::string & data) { add_identifier(data); }
+  void emit_pp_number(const std::string & data)
+  {
+    Value value;
+    if (parse_integer_literal(data, &value))
+      line_.push_back(Token(TOKEN_VALUE, value));
+    else
+      add_invalid();
+  }
+  void emit_character_literal(const std::string & data)
+  {
+    Value value;
+    if (parse_character_literal(data, &value))
+      line_.push_back(Token(TOKEN_VALUE, value));
+    else
+      add_invalid();
+  }
+  void emit_user_defined_character_literal(const std::string &) { add_invalid(); }
+  void emit_string_literal(const std::string &) { add_invalid(); }
+  void emit_user_defined_string_literal(const std::string &) { add_invalid(); }
   void emit_preprocessing_op_or_punc(const std::string & data)
-    { add(TOKEN_OPERATOR, canonical_operator(data), is_alternative_identifier(data), data); }
-  void emit_non_whitespace_char(const std::string & data) { add(TOKEN_INVALID, data); }
+  {
+    // PA1 emits these keyword spellings through the punctuation callback, but
+    // in PA3 they are identifiers (not operators) in preprocessing-token
+    // context. Alternative operator names keep both their operator and
+    // identifier-operand identities.
+    if (data == "new" || data == "delete")
+    {
+      add_identifier(data);
+      return;
+    }
+    const bool identifier = is_alternative_identifier(data);
+    const bool odd = !data.empty() &&
+      (static_cast<unsigned char>(data[0]) & 1u) != 0;
+    line_.push_back(Token(TOKEN_OPERATOR, Value(), operator_kind(data),
+                          IDENTIFIER_OTHER, identifier, odd));
+  }
+  void emit_non_whitespace_char(const std::string &) { add_invalid(); }
   void emit_eof()
   {
     finish_line();
@@ -757,10 +819,17 @@ private:
   std::ostream & output_;
   std::vector<Token> line_;
 
-  void add(TokenKind kind, const std::string & spelling, bool identifier = false,
-           const std::string & original = std::string())
+  void add_invalid()
   {
-    line_.push_back(Token(kind, spelling, identifier, original));
+    line_.push_back(Token(TOKEN_INVALID));
+  }
+
+  void add_identifier(const std::string & spelling)
+  {
+    const bool odd = !spelling.empty() &&
+      (static_cast<unsigned char>(spelling[0]) & 1u) != 0;
+    line_.push_back(Token(TOKEN_IDENTIFIER, Value(), OP_UNSUPPORTED,
+                          identifier_kind(spelling), true, odd));
   }
 
   void finish_line()
